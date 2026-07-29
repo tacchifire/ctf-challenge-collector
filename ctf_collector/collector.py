@@ -7,6 +7,15 @@ import re
 from pathlib import Path
 from urllib.parse import quote, urlsplit
 
+from .config import (
+    MAX_FILE_BYTES,
+    MAX_METADATA_BYTES,
+    MAX_PAGES,
+    MAX_PAGE_SIZE,
+    MAX_REDIRECTS,
+    MAX_TOTAL_BYTES,
+    MIN_METADATA_BYTES,
+)
 from .errors import CollectorError
 from .http import HttpClient, normalized_origin
 from .safety import (
@@ -243,6 +252,16 @@ def _verified_existing(output, parts, expected, source_identity, maximum):
     return None
 
 
+def _runtime_limit(limits, key, hard_maximum, *, minimum=1):
+    value = limits.get(key)
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        raise CollectorError(
+            "invalid_config",
+            f"{key} must be an integer within runtime bounds",
+        )
+    return min(value, hard_maximum)
+
+
 def _download(
     client,
     url,
@@ -251,7 +270,21 @@ def _download(
     target_name,
     limits,
     total_used,
+    *,
+    ctf_name,
+    local_path,
+    limit_approver=None,
 ):
+    effective_file_limit = _runtime_limit(
+        limits,
+        "max_file_bytes",
+        MAX_FILE_BYTES,
+    )
+    effective_total_limit = _runtime_limit(
+        limits,
+        "max_total_bytes",
+        MAX_TOTAL_BYTES,
+    )
     response, final_url = client.open_get(url, attachment=True)
     temporary_name = f"{target_name}.part"
     directory = None
@@ -265,10 +298,45 @@ def _download(
                     "attachment has an invalid Content-Length",
                 )
             declared = int(content_length)
-            if declared > limits["max_file_bytes"]:
-                raise CollectorError("file_too_large", "attachment exceeds file limit")
-            if total_used + declared > limits["max_total_bytes"]:
-                raise CollectorError("total_too_large", "attachments exceed total limit")
+            file_exceeded = declared > effective_file_limit
+            total_required = total_used + declared
+            total_exceeded = total_required > effective_total_limit
+            if file_exceeded or total_exceeded:
+                exceeded = (
+                    "both"
+                    if file_exceeded and total_exceeded
+                    else "file" if file_exceeded else "total"
+                )
+                request = {
+                    "ctf_name": ctf_name,
+                    "local_path": local_path,
+                    "exceeded": exceeded,
+                    "required_file_bytes": declared,
+                    "required_total_bytes": total_required,
+                    "current_file_limit": effective_file_limit,
+                    "current_total_limit": effective_total_limit,
+                }
+                within_hard_limits = (
+                    declared <= MAX_FILE_BYTES
+                    and total_required <= MAX_TOTAL_BYTES
+                )
+                approved = (
+                    within_hard_limits
+                    and limit_approver is not None
+                    and limit_approver(request) is True
+                )
+                if not approved:
+                    if file_exceeded:
+                        raise CollectorError(
+                            "file_too_large", "attachment exceeds file limit"
+                        )
+                    raise CollectorError(
+                        "total_too_large", "attachments exceed total limit"
+                    )
+                effective_file_limit = max(effective_file_limit, declared)
+                effective_total_limit = max(
+                    effective_total_limit, total_required
+                )
 
         directory, descriptor, temporary_identity = output.open_temporary(
             parent_parts,
@@ -284,11 +352,11 @@ def _download(
                     if not chunk:
                         break
                     size += len(chunk)
-                    if size > limits["max_file_bytes"]:
+                    if size > effective_file_limit:
                         raise CollectorError(
                             "file_too_large", "attachment exceeds file limit"
                         )
-                    if total_used + size > limits["max_total_bytes"]:
+                    if total_used + size > effective_total_limit:
                         raise CollectorError(
                             "total_too_large", "attachments exceed total limit"
                         )
@@ -601,9 +669,25 @@ def _preflight_configs(configs):
     return tokens
 
 
-def collect_ctf(config, *, _token=None):
+def collect_ctf(config, *, _token=None, limit_approver=None):
     token = _read_token(config["token_file"]) if _token is None else _token
     ctf_name = _validated_ctf_directory(config, (token,))
+    limits = dict(config["limits"])
+    runtime_bounds = (
+        ("page_size", MAX_PAGE_SIZE, 1),
+        ("max_pages", MAX_PAGES, 1),
+        ("max_file_bytes", MAX_FILE_BYTES, 1),
+        ("max_total_bytes", MAX_TOTAL_BYTES, 1),
+        ("max_redirects", MAX_REDIRECTS, 0),
+        ("max_metadata_bytes", MAX_METADATA_BYTES, MIN_METADATA_BYTES),
+    )
+    for key, hard_maximum, minimum in runtime_bounds:
+        limits[key] = _runtime_limit(
+            limits,
+            key,
+            hard_maximum,
+            minimum=minimum,
+        )
     client = HttpClient(
         config["base_url"],
         token,
@@ -613,7 +697,7 @@ def collect_ctf(config, *, _token=None):
         config["timeout"],
         config["retries"],
         config["tls"],
-        config["limits"],
+        limits,
     )
     ctf_parts = (ctf_name,)
     with SafeOutput(config["output_root"]) as output:
@@ -622,7 +706,7 @@ def collect_ctf(config, *, _token=None):
         old_files = _read_old_manifest(output, manifest_parts)
         failures = []
         if config["platform"] == "ctfd":
-            raw_challenges = _fetch_ctfd(client, config["limits"], failures)
+            raw_challenges = _fetch_ctfd(client, limits, failures)
         else:
             raw_challenges = _fetch_rctf(client, failures)
 
@@ -727,11 +811,11 @@ def collect_ctf(config, *, _token=None):
                     target_parts,
                     old_files.get(local_path),
                     source_identity,
-                    config["limits"]["max_file_bytes"],
+                    limits["max_file_bytes"],
                 )
                 if verified is not None:
                     size, digest = verified
-                    if total_used + size > config["limits"]["max_total_bytes"]:
+                    if total_used + size > limits["max_total_bytes"]:
                         error = CollectorError(
                             "total_too_large", "attachments exceed total limit"
                         )
@@ -757,8 +841,11 @@ def collect_ctf(config, *, _token=None):
                         output,
                         target_parts[:-1],
                         filename,
-                        config["limits"],
+                        limits,
                         total_used,
+                        ctf_name=ctf_name,
+                        local_path=local_path,
+                        limit_approver=limit_approver,
                     )
                     total_used += size
                     entry.update(
@@ -815,7 +902,7 @@ def collect_ctf(config, *, _token=None):
         return manifest
 
 
-def collect_all(configs, selected=None):
+def collect_all(configs, selected=None, *, limit_approver=None):
     if selected is not None:
         configs = [config for config in configs if config["name"] == selected]
         if not configs:
@@ -824,7 +911,11 @@ def collect_all(configs, selected=None):
     results = []
     for config, token in zip(configs, tokens):
         try:
-            manifest = collect_ctf(config, _token=token)
+            manifest = collect_ctf(
+                config,
+                _token=token,
+                limit_approver=limit_approver,
+            )
             results.append(
                 {
                     "name": config["name"],

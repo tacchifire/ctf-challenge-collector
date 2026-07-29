@@ -61,6 +61,27 @@ def make_parser():
     return parser
 
 
+def _terminal_limit_approver(request):
+    print(
+        f"{request['ctf_name']}: {request['local_path']} requires "
+        f"{request['required_file_bytes']} bytes for this file and "
+        f"{request['required_total_bytes']} bytes total; current limits are "
+        f"{request['current_file_limit']} and "
+        f"{request['current_total_limit']} bytes. Continue? Type yes: ",
+        file=sys.stderr,
+        end="",
+        flush=True,
+    )
+    answer = sys.stdin.readline()
+    return answer.rstrip("\r\n") == "yes"
+
+
+def _interactive_limit_approver():
+    if sys.stdin.isatty() and sys.stderr.isatty():
+        return _terminal_limit_approver
+    return None
+
+
 def main(argv=None):
     args = make_parser().parse_args(argv)
     try:
@@ -69,7 +90,11 @@ def main(argv=None):
             print(f"Created {args.config}")
             return 0
         configs = load_config(args.config)
-        results = collect_all(configs, selected=args.ctf)
+        results = collect_all(
+            configs,
+            selected=args.ctf,
+            limit_approver=_interactive_limit_approver(),
+        )
         failed = False
         for result in results:
             if result["error"] is not None:

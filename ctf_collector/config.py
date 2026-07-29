@@ -12,6 +12,13 @@ DEFAULT_RETRIES = {
     "backoff_seconds": 0.5,
     "max_retry_after_seconds": 30.0,
 }
+MAX_PAGE_SIZE = 100
+MAX_PAGES = 1000
+MAX_FILE_BYTES = 1024 ** 4
+MAX_TOTAL_BYTES = 1024 ** 5
+MAX_REDIRECTS = 10
+MIN_METADATA_BYTES = 1024
+MAX_METADATA_BYTES = 1024 ** 3
 DEFAULT_LIMITS = {
     "page_size": 100,
     "max_pages": 100,
@@ -128,17 +135,17 @@ def load_config(path):
             raise CollectorError("invalid_config", "limits must be an object")
         limits = {
             "page_size": _number(
-                limits_raw, "page_size", 100, 1, 100, integer=True
+                limits_raw, "page_size", 100, 1, MAX_PAGE_SIZE, integer=True
             ),
             "max_pages": _number(
-                limits_raw, "max_pages", 100, 1, 1000, integer=True
+                limits_raw, "max_pages", 100, 1, MAX_PAGES, integer=True
             ),
             "max_file_bytes": _number(
                 limits_raw,
                 "max_file_bytes",
                 DEFAULT_LIMITS["max_file_bytes"],
                 1,
-                1024 ** 4,
+                MAX_FILE_BYTES,
                 integer=True,
             ),
             "max_total_bytes": _number(
@@ -146,18 +153,18 @@ def load_config(path):
                 "max_total_bytes",
                 DEFAULT_LIMITS["max_total_bytes"],
                 1,
-                1024 ** 5,
+                MAX_TOTAL_BYTES,
                 integer=True,
             ),
             "max_redirects": _number(
-                limits_raw, "max_redirects", 5, 0, 10, integer=True
+                limits_raw, "max_redirects", 5, 0, MAX_REDIRECTS, integer=True
             ),
             "max_metadata_bytes": _number(
                 limits_raw,
                 "max_metadata_bytes",
                 DEFAULT_LIMITS["max_metadata_bytes"],
-                1024,
-                1024 ** 3,
+                MIN_METADATA_BYTES,
+                MAX_METADATA_BYTES,
                 integer=True,
             ),
         }
