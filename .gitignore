@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.coverage
+collector.json
+
+# 認証情報と収集結果
+secrets/
+*.token
+collected/
+output/
+
+# 原子的保存で使う一時ファイル
+*.part
