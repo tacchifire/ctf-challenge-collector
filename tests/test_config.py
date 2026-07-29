@@ -8,6 +8,38 @@ from ctf_collector.errors import CollectorError
 
 
 class ConfigTests(unittest.TestCase):
+    def test_minimal_ctf_uses_safe_defaults_relative_to_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "nested" / "collector.json"
+            config_path.parent.mkdir()
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "ctfs": [
+                            {
+                                "name": "minimal",
+                                "platform": "ctfd",
+                                "base_url": "https://ctf.example",
+                                "token_file": "./secrets/minimal.token",
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            config = load_config(config_path)[0]
+
+            self.assertEqual(
+                config["output_root"],
+                (config_path.parent / "collected").resolve(),
+            )
+            self.assertEqual(config["timeout"], 30.0)
+            self.assertEqual(config["retries"]["max_attempts"], 3)
+            self.assertEqual(config["limits"]["max_file_bytes"], 100 * 1024 * 1024)
+            self.assertTrue(config["tls"]["verify"])
+            self.assertTrue(config["fail_on_partial"])
+
     def test_multiple_ctfs_and_relative_paths(self):
         with tempfile.TemporaryDirectory() as tmp:
             config_path = Path(tmp) / "nested" / "config.json"

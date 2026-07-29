@@ -56,7 +56,7 @@ def load_config(path):
     for index, item in enumerate(raw["ctfs"]):
         if not isinstance(item, dict):
             raise CollectorError("invalid_config", f"ctfs[{index}] must be an object")
-        for required in ("name", "platform", "base_url", "token_file", "output_root"):
+        for required in ("name", "platform", "base_url", "token_file"):
             if not isinstance(item.get(required), str) or not item[required]:
                 raise CollectorError(
                     "invalid_config",
@@ -65,7 +65,13 @@ def load_config(path):
         if item["name"] in names:
             raise CollectorError("invalid_config", f"duplicate CTF name: {item['name']}")
         names.add(item["name"])
-        output_root = _relative(config_path, item["output_root"])
+        output_root_value = item.get("output_root", "./collected")
+        if not isinstance(output_root_value, str) or not output_root_value:
+            raise CollectorError(
+                "invalid_config",
+                f"ctfs[{index}].output_root must be a non-empty string",
+            )
+        output_root = _relative(config_path, output_root_value)
         output_directory = (
             output_root,
             ctf_directory_name(item["name"]).casefold(),

@@ -1,61 +1,10 @@
 {
   "ctfs": [
     {
-      "base_url": "https://ctfd.example.invalid",
-      "fail_on_partial": true,
-      "limits": {
-        "max_file_bytes": 104857600,
-        "max_metadata_bytes": 16777216,
-        "max_pages": 100,
-        "max_redirects": 5,
-        "max_total_bytes": 1073741824,
-        "page_size": 100
-      },
       "name": "example-ctfd",
-      "output_root": "./collected",
       "platform": "ctfd",
-      "retries": {
-        "backoff_seconds": 0.5,
-        "max_attempts": 3,
-        "max_retry_after_seconds": 30
-      },
-      "timeouts": {
-        "request_seconds": 30
-      },
-      "tls": {
-        "verify": true
-      },
-      "token_file": "./secrets/example-ctfd.token",
-      "unauthenticated_attachment_origins": []
-    },
-    {
-      "base_url": "https://rctf.example.invalid",
-      "fail_on_partial": true,
-      "limits": {
-        "max_file_bytes": 104857600,
-        "max_metadata_bytes": 16777216,
-        "max_pages": 100,
-        "max_redirects": 5,
-        "max_total_bytes": 1073741824,
-        "page_size": 100
-      },
-      "name": "example-rctf",
-      "output_root": "./collected",
-      "platform": "rctf",
-      "retries": {
-        "backoff_seconds": 0.5,
-        "max_attempts": 3,
-        "max_retry_after_seconds": 30
-      },
-      "timeouts": {
-        "request_seconds": 30
-      },
-      "tls": {
-        "verify": true
-      },
-      "token_file": "./secrets/example-rctf.token",
-      "unauthenticated_attachment_origins": []
+      "base_url": "https://ctf.example.invalid",
+      "token_file": "./secrets/example-ctfd.token"
     }
-  ],
-  "fail_on_partial": true
+  ]
 }
