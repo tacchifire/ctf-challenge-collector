@@ -5,7 +5,9 @@ reporter prints only values the collector has already redacted, and scrubs
 them again for control sequences before they reach the stream.
 """
 
+import os
 import time
+import unicodedata
 
 from .safety import display_name, display_path, display_text
 
@@ -16,6 +18,16 @@ BYTE_UNITS = (
     ("MiB", 1024 ** 2),
     ("KiB", 1024),
 )
+# The width assumed for a terminal that will not say how wide it is. Eighty is
+# the narrowest width still in common use, so a line composed for it also fits
+# the terminals we could not measure.
+DEFAULT_COLUMNS = 80
+ELLIPSIS = "..."
+WIDE_WIDTHS = frozenset(("W", "F"))
+# The columns the gauge spends between its brackets when the line can afford
+# it. Twenty divides the percentage into steps the eye can follow and still
+# leaves an eighty column terminal room for the figures beside it.
+BAR_CELLS = 20
 
 
 def format_bytes(count):
@@ -24,6 +36,83 @@ def format_bytes(count):
         if count >= scale:
             return f"{count / scale:.1f} {suffix}"
     return f"{count} B"
+
+
+def format_bar(percent, cells=BAR_CELLS):
+    """A gauge of `cells` columns, filled to `percent`.
+
+    The gauge occupies the same columns at every percentage, so the figures
+    beside it keep their place on the line instead of sliding along it as the
+    download runs. What has not arrived is spaces rather than a second
+    character: the line is redrawn where it stands, and only the part that
+    changed should look like it changed. The head of the fill is an arrow
+    while anything is still to come, and a finished download is solid, since
+    an arrow at the end would point past the end of the file.
+    """
+    filled = min(int(percent), 100) * cells // 100
+    if filled >= cells:
+        return "=" * cells
+    return "=" * filled + ">" + " " * (cells - filled - 1)
+
+
+def cell_width(text):
+    """The columns a terminal advances for `text`.
+
+    The reporter reclaims its line by returning to the start of it, which only
+    works while the line is narrower than the terminal, and a terminal counts
+    columns rather than characters: an East Asian wide or fullwidth character
+    takes two of them and a combining mark takes none.
+    """
+    width = 0
+    for character in text:
+        if unicodedata.combining(character):
+            continue
+        # Width tables differ across terminal emulators.  Treating every
+        # non-ASCII printable code point as two cells can leave spare room but
+        # cannot underestimate it and wrap the live line.
+        width += 1 if ord(character) < 128 else 2
+    return width
+
+
+def clip(text, columns):
+    """`text` cut down to `columns` columns, marked where it was cut.
+
+    The cut falls between characters, because half of a wide character is not
+    a character a terminal can draw and a mark severed from what it modifies
+    is not the text we measured. Below the width of the marker itself there is
+    nothing left that could be said truthfully, so nothing is said.
+    """
+    if cell_width(text) <= columns:
+        return text
+    budget = columns - cell_width(ELLIPSIS)
+    if budget < 0:
+        return ""
+    kept = []
+    used = 0
+    for character in text:
+        width = cell_width(character)
+        if used + width > budget:
+            break
+        kept.append(character)
+        used += width
+    return "".join(kept) + ELLIPSIS
+
+
+def terminal_columns(stream, fallback=DEFAULT_COLUMNS):
+    """How wide the terminal is now.
+
+    A window is resized while a long download is in flight, and the line we
+    are about to redraw has to fit the window as it is at that moment, so the
+    width is asked for again rather than remembered. A stream that cannot
+    answer - one that is not a file, or a terminal that reports no size at
+    all - is treated as the default terminal, since guessing wide would wrap
+    the line on exactly the terminals we could not check.
+    """
+    try:
+        columns = os.get_terminal_size(stream.fileno()).columns
+    except Exception:
+        return fallback
+    return columns if columns > 0 else fallback
 
 
 def _is_terminal(stream):
@@ -84,7 +173,7 @@ class ProgressReporter:
         self._stream.write(f"[{display_text(ctf, 60)}] {message}\n")
         self._stream.flush()
 
-    def _update(self, ctf, message):
+    def _update(self, line, columns):
         """Redraw the in-place line a terminal keeps for the current download.
 
         A carriage return is the whole vocabulary: it returns to the start of
@@ -92,14 +181,106 @@ class ProgressReporter:
         An update that is shorter than the one it replaces would otherwise
         leave the tail of the old text standing, so the difference is written
         over with spaces rather than erased with a cursor control sequence.
+        The erasing stops at the last column as well: a window that has just
+        been narrowed cannot be cleaned past its own edge, and spaces written
+        past it would wrap and cost us the line we are reclaiming.
         """
-        line = f"[{display_text(ctf, 60)}] {message}"
+        width = cell_width(line)
+        # A resize may have reflowed the old live line before this redraw.  In
+        # that case a carriage return reaches only its final screen row, so
+        # settle it once and begin a fresh width-safe line.
+        if self._live is not None and self._live > columns:
+            self._settle()
         if self._live is None:
             self._stream.write(line)
         else:
-            self._stream.write(f"\r{line}{' ' * max(0, self._live - len(line))}")
+            erased = max(0, min(self._live, columns) - width)
+            self._stream.write(f"\r{line}{' ' * erased}")
         self._stream.flush()
-        self._live = len(line)
+        self._live = width
+
+    @staticmethod
+    def _fit(candidates, columns):
+        """The first candidate that fits `columns` columns, cut down if none do.
+
+        A line wider than the terminal is a line the carriage return can no
+        longer reclaim: the terminal wraps it, the return only reaches the
+        start of its last screen row, and every update after that is appended
+        to the wreckage of the one before instead of replacing it. The
+        candidates are therefore offered widest first and the first one the
+        terminal can hold is drawn. A terminal too narrow for even the last of
+        them gets that one cut to the width, which is the only remaining way
+        to stay on one row.
+        """
+        line = ""
+        for line in candidates:
+            if cell_width(line) <= columns:
+                return line
+        if columns > 0 and "%" in line:
+            # The numeric share cannot fit in one or two columns; preserving
+            # the percent marker is still better than silence or an ellipsis.
+            return "%"
+        return clip(line, columns)
+
+    @staticmethod
+    def _measured_lines(head, percent, sized, rate):
+        """Every form of an update with a declared size, widest first.
+
+        What a narrow line cannot afford it gives up in the order the reader
+        misses least. The rate goes first: it describes how the transfer is
+        going rather than how far it has got. The name of the CTF goes next,
+        because one CTF is collected at a time and its name is already on the
+        line above. The byte counts follow, since the gauge and the share say
+        the same thing in fewer columns. Then the gauge itself narrows, cell
+        by cell, down to a single one. The share is the last thing standing:
+        an update that no longer says how far along it is has stopped being
+        progress at all, so on a terminal too narrow for anything else it is
+        spelled without the padding that keeps it aligned.
+        """
+        share = f"{percent:3d}%"
+        gauge = f"[{format_bar(percent)}]"
+        yield f"{head}{gauge} {share} {sized}{rate}"
+        yield f"{head}{gauge} {share} {sized}"
+        yield f"{gauge} {share} {sized}"
+        yield f"{gauge} {share}"
+        for cells in range(BAR_CELLS - 1, 0, -1):
+            yield f"[{format_bar(percent, cells)}] {share}"
+        yield f"{percent}%"
+
+    @staticmethod
+    def _unmeasured_lines(head, transferred, rate):
+        """Every form of an update without a declared size, widest first.
+
+        Nothing here knows the distance to the end, so there is no gauge to
+        draw and no share to spell: a bar filled from a size the server never
+        declared would be an invention, and the one number this update has is
+        the count of what has arrived. It gives up the rate and then the name
+        of the CTF, in that order, and below that there is only the count to
+        cut into.
+        """
+        yield f"{head}{transferred}{rate}"
+        yield f"{head}{transferred}"
+        yield transferred
+
+    def _live_line(self, ctf, received, declared, rate, columns):
+        """The update the terminal is shown, composed for the width it has now.
+
+        The path is not repeated here. It is on the line that announced the
+        download, it does not change between redraws, and spending the width
+        on it again would push out the gauge and the figures that do change.
+        """
+        head = f"[{display_text(ctf, 60)}] "
+        transferred = format_bytes(received)
+        if declared:
+            candidates = self._measured_lines(
+                head,
+                received * 100 // declared,
+                f"{transferred}/{format_bytes(declared)}",
+                rate,
+            )
+        else:
+            candidates = self._unmeasured_lines(head, transferred, rate)
+        return self._fit(candidates, columns)
 
     @staticmethod
     def _path(event):
@@ -192,16 +373,19 @@ class ProgressReporter:
         if not self._terminal:
             return
 
-        declared = event.get("declared")
-        transferred = format_bytes(received)
-        if declared:
-            transferred += (
-                f"/{format_bytes(declared)} ({received * 100 // declared}%)"
-            )
         elapsed = now - state["started"]
-        if elapsed > 0:
-            transferred += f" {format_bytes(received / elapsed)}/s"
-        self._update(event["ctf"], f"{self._path(event)} {transferred}")
+        rate = f" {format_bytes(received / elapsed)}/s" if elapsed > 0 else ""
+        columns = terminal_columns(self._stream)
+        self._update(
+            self._live_line(
+                event["ctf"],
+                received,
+                event.get("declared"),
+                rate,
+                columns,
+            ),
+            columns,
+        )
 
     def _on_attachment_done(self, event):
         state = self._download

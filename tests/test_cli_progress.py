@@ -102,7 +102,12 @@ class SyncProgressWiringTests(unittest.TestCase):
 
         self.download(collect_all.call_args.kwargs["progress"])
 
-        self.assertIn("32.0 MiB/64.0 MiB (50%)", stderr.getvalue())
+        # The rate is measured against the real clock the CLI wires in, so the
+        # gauge and the counts are what can be named exactly here.
+        self.assertIn(
+            f"[probe] [{'=' * 10}>{' ' * 9}]  50% 32.0 MiB/64.0 MiB",
+            stderr.getvalue(),
+        )
 
     def test_the_reporter_writes_to_stderr_and_never_to_stdout(self):
         _code, collect_all, stdout, stderr = self.call_sync()
