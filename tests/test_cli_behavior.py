@@ -127,5 +127,48 @@ class SyncCliBehaviorTests(unittest.TestCase):
         )
 
 
+class OversizePromptDisclosureTests(unittest.TestCase):
+    """The first prompt is the only one, so it says what a yes buys.
+
+    The operator answers once for a whole run, which is only informed
+    consent if the prompt states the three terms of that grant: what else
+    the answer covers, what it cannot raise, and when it lapses.
+    """
+
+    REQUEST = {
+        "ctf_name": "event",
+        "local_path": "web/1-One/files/large.bin",
+        "exceeded": "both",
+        "required_file_bytes": 6,
+        "required_total_bytes": 10,
+        "current_file_limit": 5,
+        "current_total_limit": 9,
+    }
+
+    def prompt(self):
+        stderr = StringIO()
+        with (
+            patch.object(cli.sys, "stdin", StringIO("yes\n")),
+            redirect_stderr(stderr),
+        ):
+            cli._terminal_limit_approver(dict(self.REQUEST))
+        return stderr.getvalue()
+
+    def test_prompt_says_yes_covers_the_rest_of_the_sync_run(self):
+        self.assertIn(
+            "approves every attachment that exceeds these limits for the "
+            "rest of this sync run",
+            self.prompt(),
+        )
+
+    def test_prompt_says_each_attachment_stays_within_the_absolute_caps(self):
+        prompt = self.prompt()
+        self.assertIn("the finite size it declares", prompt)
+        self.assertIn("absolute hard caps", prompt)
+
+    def test_prompt_says_the_approval_expires_when_the_run_ends(self):
+        self.assertIn("expires when this run ends", self.prompt())
+
+
 if __name__ == "__main__":
     unittest.main()

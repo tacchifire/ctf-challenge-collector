@@ -63,12 +63,22 @@ def make_parser():
 
 
 def _terminal_limit_approver(request):
+    """Ask once, for the run, in the terms the run will actually honour.
+
+    The collector asks about the first oversized attachment and keeps the
+    answer for everything after it, so a prompt that named only this file
+    would be asking for less than it takes.
+    """
     print(
         f"{request['ctf_name']}: {request['local_path']} requires "
         f"{request['required_file_bytes']} bytes for this file and "
         f"{request['required_total_bytes']} bytes total; current limits are "
         f"{request['current_file_limit']} and "
-        f"{request['current_total_limit']} bytes. Continue? Type yes: ",
+        f"{request['current_total_limit']} bytes. Answering yes approves "
+        "every attachment that exceeds these limits for the rest of this "
+        "sync run, each one only up to the finite size it declares and "
+        "always within the absolute hard caps; the approval expires when "
+        "this run ends. Continue? Type yes: ",
         file=sys.stderr,
         end="",
         flush=True,

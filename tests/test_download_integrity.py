@@ -13,7 +13,7 @@ import unittest
 from unittest.mock import patch
 from urllib.parse import urlsplit
 
-from ctf_collector.collector import _download, collect_ctf
+from ctf_collector.collector import _download, collect_all, collect_ctf
 from ctf_collector.config import MAX_TOTAL_BYTES
 from ctf_collector.errors import CollectorError
 from ctf_collector.safety import ctf_directory_name
@@ -308,49 +308,105 @@ class DownloadIntegrityTests(unittest.TestCase):
                 self.assertEqual(stored, ["scoped.bin"])
                 self.assertEqual(leftovers, [])
 
-    def test_approval_is_not_inherited_by_the_next_attachment(self):
-        requests = []
-        decisions = iter((True, False))
+    def two_oversize_attachments(self, request):
+        listing = challenge_listing(
+            request,
+            ["/files/first.bin", "/files/second.bin"],
+        )
+        if listing is not None:
+            return listing
+        if urlsplit(request["url"]).path in {
+            "/files/first.bin",
+            "/files/second.bin",
+        }:
+            return 200, {"Content-Length": "6"}, b"123456"
+        return 404, {}, b"missing"
 
-        def responder(request):
-            listing = challenge_listing(
-                request,
-                ["/files/first.bin", "/files/second.bin"],
-            )
-            if listing is not None:
-                return listing
-            if urlsplit(request["url"]).path in {
-                "/files/first.bin",
-                "/files/second.bin",
-            }:
-                return 200, {"Content-Length": "6"}, b"123456"
-            return 404, {}, b"missing"
+    OVERSIZE_LIMITS = {
+        "page_size": 2,
+        "max_pages": 10,
+        "max_file_bytes": 5,
+        "max_total_bytes": 20,
+        "max_redirects": 3,
+        "max_metadata_bytes": 1024 * 1024,
+    }
+
+    def test_one_approval_covers_every_oversize_attachment_in_the_run(self):
+        requests = []
 
         def approve(request):
             requests.append(request)
-            return next(decisions)
+            return True
 
         manifest, stored, leftovers = self.collect(
-            responder,
+            self.two_oversize_attachments,
             limit_approver=approve,
-            limits={
-                "page_size": 2,
-                "max_pages": 10,
-                "max_file_bytes": 5,
-                "max_total_bytes": 20,
-                "max_redirects": 3,
-                "max_metadata_bytes": 1024 * 1024,
-            },
+            limits=dict(self.OVERSIZE_LIMITS),
+        )
+
+        self.assertEqual(manifest["status"], "complete")
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(
+            [entry["status"] for entry in manifest["challenges"][0]["files"]],
+            ["downloaded", "downloaded"],
+        )
+        self.assertEqual(stored, ["first.bin", "second.bin"])
+        self.assertEqual(leftovers, [])
+
+    def test_a_refusal_is_not_asked_again_for_the_rest_of_the_run(self):
+        requests = []
+
+        def refuse(request):
+            requests.append(request)
+            return False
+
+        manifest, stored, leftovers = self.collect(
+            self.two_oversize_attachments,
+            limit_approver=refuse,
+            limits=dict(self.OVERSIZE_LIMITS),
         )
 
         self.assertEqual(manifest["status"], "partial")
-        self.assertEqual(len(requests), 2)
+        self.assertEqual(len(requests), 1)
         self.assertEqual(
             [entry["status"] for entry in manifest["challenges"][0]["files"]],
-            ["downloaded", "failed"],
+            ["failed", "failed"],
         )
-        self.assertEqual(stored, ["first.bin"])
+        self.assertEqual(stored, [])
         self.assertEqual(leftovers, [])
+
+    def test_an_approver_that_raises_refuses_the_run_without_asking_again(self):
+        requests = []
+
+        def explode(request):
+            requests.append(request)
+            raise RuntimeError("the prompt is broken")
+
+        manifest, stored, leftovers = self.collect(
+            self.two_oversize_attachments,
+            limit_approver=explode,
+            limits=dict(self.OVERSIZE_LIMITS),
+        )
+
+        self.assertEqual(manifest["status"], "partial")
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(
+            [entry["status"] for entry in manifest["challenges"][0]["files"]],
+            ["failed", "failed"],
+        )
+        self.assertEqual(stored, [])
+        self.assertEqual(leftovers, [])
+
+    def test_an_interrupt_at_the_prompt_still_reaches_the_operator(self):
+        def interrupt(request):
+            raise KeyboardInterrupt
+
+        with self.assertRaises(KeyboardInterrupt):
+            self.collect(
+                self.two_oversize_attachments,
+                limit_approver=interrupt,
+                limits=dict(self.OVERSIZE_LIMITS),
+            )
 
     def test_unknown_oversize_does_not_request_unbounded_approval(self):
         requests = []
@@ -548,6 +604,57 @@ class DownloadIntegrityTests(unittest.TestCase):
                 collect_ctf(config)
 
         self.assertEqual(caught.exception.code, "network_error")
+
+
+class RunApprovalScopeTests(unittest.TestCase):
+    """The run is the unit of approval: one answer covers it, and only it."""
+
+    LIMITS = {
+        "page_size": 2,
+        "max_pages": 10,
+        "max_file_bytes": 5,
+        "max_total_bytes": 20,
+        "max_redirects": 3,
+        "max_metadata_bytes": 1024 * 1024,
+    }
+
+    @staticmethod
+    def responder(request):
+        listing = challenge_listing(request, ["/files/big.bin"])
+        if listing is not None:
+            return listing
+        if urlsplit(request["url"]).path == "/files/big.bin":
+            return 200, {"Content-Length": "6"}, b"123456"
+        return 404, {}, b"missing"
+
+    def run_collection(self, tmp, names, limit_approver):
+        configs = [
+            make_config(tmp, name=name, limits=dict(self.LIMITS))
+            for name in names
+        ]
+        fake = FakeOpener(self.responder)
+        with patch("ctf_collector.http.build_opener", return_value=fake):
+            results = collect_all(configs, limit_approver=limit_approver)
+        stored = sorted(
+            path.name
+            for path in (Path(tmp) / "out").rglob("*")
+            if path.is_file() and path.parent.name == "files"
+        )
+        return results, stored
+
+    def test_one_approval_covers_every_ctf_in_the_same_run(self):
+        requests = []
+
+        with tempfile.TemporaryDirectory() as tmp:
+            results, stored = self.run_collection(
+                tmp,
+                ("first-ctf", "second-ctf"),
+                lambda request: requests.append(request) or True,
+            )
+
+        self.assertEqual(len(requests), 1)
+        self.assertEqual([result["partial"] for result in results], [False, False])
+        self.assertEqual(stored, ["big.bin", "big.bin"])
 
 
 if __name__ == "__main__":

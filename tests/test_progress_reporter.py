@@ -267,6 +267,212 @@ class AttachmentProgressTests(ReporterHarness):
         )
 
 
+class FakeTerminal(StringIO):
+    """A stream that claims to be a terminal, so raw control bytes stay visible."""
+
+    def isatty(self):
+        return True
+
+
+TERMINAL_PATH = "pwn/1-One/files/big.bin"
+
+
+class TerminalProgressLineTests(ReporterHarness):
+    """On a terminal one download owns one line until that line is settled."""
+
+    def make(self, **kwargs):
+        stream = FakeTerminal()
+        clock = FakeClock()
+        reporter = ProgressReporter(stream, now=clock, **kwargs)
+        return reporter, stream, clock
+
+    def start(self, reporter, path=TERMINAL_PATH):
+        reporter(
+            {
+                "event": "attachment_start",
+                "ctf": "x",
+                "local_path": path,
+                "declared": 10 * MIB,
+            }
+        )
+
+    def progress(self, reporter, received, path=TERMINAL_PATH):
+        reporter(
+            {
+                "event": "attachment_progress",
+                "ctf": "x",
+                "local_path": path,
+                "received": received,
+                "declared": 10 * MIB,
+            }
+        )
+
+    def test_repeated_progress_rewrites_one_line_instead_of_adding_lines(self):
+        reporter, stream, clock = self.make(min_interval=1.0, min_bytes=4 * MIB)
+        self.start(reporter)
+
+        for received in (1 * MIB, 2 * MIB, 3 * MIB):
+            clock.advance(1.0)
+            self.progress(reporter, received)
+
+        raw = stream.getvalue()
+        # Only the start line ends; the three updates share the line below it.
+        self.assertEqual(raw.count("\n"), 1, raw)
+        self.assertEqual(raw.count("\r"), 2, raw)
+        self.assertTrue(
+            raw.endswith(f"[x] {TERMINAL_PATH} 3.0 MiB/10.0 MiB (30%) 1.0 MiB/s"),
+            raw,
+        )
+
+
+    def test_a_shorter_update_erases_the_tail_of_the_longer_one(self):
+        reporter, stream, clock = self.make(min_interval=1.0, min_bytes=4 * MIB)
+        self.start(reporter)
+        clock.advance(1.0)
+        self.progress(reporter, MIB - 1)
+        clock.advance(1.0)
+
+        self.progress(reporter, 2 * MIB)
+
+        long_line = f"[x] {TERMINAL_PATH} 1024.0 KiB/10.0 MiB (9%) 1024.0 KiB/s"
+        short_line = f"[x] {TERMINAL_PATH} 2.0 MiB/10.0 MiB (20%) 1.0 MiB/s"
+        self.assertGreater(len(long_line), len(short_line))
+        head, _, tail = stream.getvalue().rpartition("\r")
+        self.assertTrue(head.endswith(long_line), head)
+        # Spaces, not cursor control: the reporter adds no escape vocabulary.
+        self.assertEqual(
+            tail,
+            short_line + " " * (len(long_line) - len(short_line)),
+        )
+        self.assertNotIn("\x1b", stream.getvalue())
+
+
+    def live_download(self):
+        """A download with one update already drawn on the live line."""
+        reporter, stream, clock = self.make(min_interval=1.0, min_bytes=4 * MIB)
+        self.start(reporter)
+        clock.advance(1.0)
+        self.progress(reporter, MIB)
+        clock.advance(1.0)
+        return reporter, stream, clock
+
+    def test_completion_settles_the_live_line_with_one_newline(self):
+        reporter, stream, _clock = self.live_download()
+
+        reporter(
+            {
+                "event": "attachment_done",
+                "ctf": "x",
+                "local_path": TERMINAL_PATH,
+                "size": 10 * MIB,
+                "status": "downloaded",
+            }
+        )
+
+        raw = stream.getvalue()
+        # The start line, the settled progress line and the saved line.
+        self.assertEqual(raw.count("\n"), 3, raw)
+        self.assertNotIn("\n\n", raw)
+        self.assertEqual(
+            self.lines(stream)[-1],
+            f"[x] saved {TERMINAL_PATH} (10.0 MiB in 2.0s)",
+        )
+
+    def test_failure_settles_the_live_line_with_one_newline(self):
+        reporter, stream, _clock = self.live_download()
+
+        reporter(
+            {
+                "event": "attachment_failed",
+                "ctf": "x",
+                "local_path": TERMINAL_PATH,
+                "code": "file_too_large",
+            }
+        )
+
+        raw = stream.getvalue()
+        self.assertEqual(raw.count("\n"), 3, raw)
+        self.assertEqual(
+            self.lines(stream)[1],
+            f"[x] {TERMINAL_PATH} 1.0 MiB/10.0 MiB (10%) 1.0 MiB/s",
+        )
+        self.assertEqual(
+            self.lines(stream)[-1],
+            f"[x] failed {TERMINAL_PATH} (file_too_large)",
+        )
+
+    def test_the_next_attachment_settles_the_previous_line_once(self):
+        reporter, stream, _clock = self.live_download()
+
+        self.start(reporter, path="pwn/2-Two/files/other.bin")
+
+        raw = stream.getvalue()
+        self.assertEqual(raw.count("\n"), 3, raw)
+        self.assertEqual(raw.count("\r"), 0, raw)
+        self.assertEqual(
+            self.lines(stream)[-1],
+            "[x] downloading pwn/2-Two/files/other.bin (10.0 MiB)",
+        )
+
+
+class RecordingStream:
+    """The whole stream interface the reporter uses, and no isatty at all."""
+
+    def __init__(self):
+        self.text = ""
+
+    def write(self, value):
+        self.text += value
+
+    def flush(self):
+        pass
+
+
+class ClosedStream(RecordingStream):
+    def isatty(self):
+        raise ValueError("I/O operation on closed file")
+
+
+class UnanswerableTerminalTests(unittest.TestCase):
+    """In-place updates need a terminal's word for it, not a guess.
+
+    A stream that cannot say whether it is one is treated as a plain stream,
+    because a line rewritten into a log or a pipe is a line that was lost.
+    """
+
+    def test_a_stream_that_cannot_answer_isatty_keeps_writing_plain_lines(self):
+        for stream in (RecordingStream(), ClosedStream()):
+            with self.subTest(stream=type(stream).__name__):
+                reporter = ProgressReporter(
+                    stream,
+                    now=FakeClock(),
+                    min_interval=0.0,
+                    min_bytes=0,
+                )
+
+                reporter(
+                    {
+                        "event": "attachment_start",
+                        "ctf": "x",
+                        "local_path": TERMINAL_PATH,
+                        "declared": 10 * MIB,
+                    }
+                )
+                for received in (MIB, 2 * MIB):
+                    reporter(
+                        {
+                            "event": "attachment_progress",
+                            "ctf": "x",
+                            "local_path": TERMINAL_PATH,
+                            "received": received,
+                            "declared": 10 * MIB,
+                        }
+                    )
+
+                self.assertNotIn("\r", stream.text)
+                self.assertEqual(len(stream.text.splitlines()), 3, stream.text)
+
+
 class UnknownLengthTests(ReporterHarness):
     def test_start_without_content_length_says_the_size_is_unknown(self):
         reporter, stream, _clock = self.make()

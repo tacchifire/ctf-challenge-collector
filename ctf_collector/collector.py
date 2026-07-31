@@ -82,6 +82,48 @@ def _safe_progress(callback):
     return _SafeProgress(callback)
 
 
+class _RunApproval:
+    """The one answer a run gets about attachments that exceed its limits.
+
+    The operator is asked about the first oversized attachment and answered
+    for the whole run, because a collection that stops to ask again at every
+    attachment is a collection nobody is watching by the end of it. What is
+    approved is the exceeding, not an amount: each attachment is still held to
+    a finite limit derived from the size it declares, and the absolute caps are
+    settled before this is consulted at all.
+    """
+
+    def __init__(self, approver):
+        self._approver = approver
+        self._decision = None
+
+    def __call__(self, request):
+        if self._decision is None:
+            self._decision = self._ask(request)
+        return self._decision
+
+    def _ask(self, request):
+        """The operator's answer, with anything that is not a yes read as no.
+
+        A prompt that fails has not approved anything, and asking it again for
+        every later attachment would only repeat the failure, so the refusal
+        is recorded like any other. An interrupt is not an answer: it is the
+        operator stopping the run, so it is left to reach them.
+        """
+        if self._approver is None:
+            return False
+        try:
+            return self._approver(request) is True
+        except Exception:
+            return False
+
+
+def _run_approval(approver):
+    if isinstance(approver, _RunApproval):
+        return approver
+    return _RunApproval(approver)
+
+
 def _notify(progress, event, **fields):
     """Report a milestone so a long run never looks hung.
 
@@ -760,6 +802,7 @@ def _preflight_configs(configs):
 
 def collect_ctf(config, *, _token=None, limit_approver=None, progress=None):
     progress = _safe_progress(progress)
+    limit_approver = _run_approval(limit_approver)
     token = _read_token(config["token_file"]) if _token is None else _token
     ctf_name = _validated_ctf_directory(config, (token,))
     limits = dict(config["limits"])
@@ -1044,6 +1087,9 @@ def collect_ctf(config, *, _token=None, limit_approver=None, progress=None):
 
 def collect_all(configs, selected=None, *, limit_approver=None, progress=None):
     progress = _safe_progress(progress)
+    # One run, one answer: the approval is settled here so that every CTF
+    # below shares it instead of asking the operator again.
+    limit_approver = _run_approval(limit_approver)
     if selected is not None:
         configs = [config for config in configs if config["name"] == selected]
         if not configs:

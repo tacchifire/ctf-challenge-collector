@@ -26,6 +26,20 @@ def format_bytes(count):
     return f"{count} B"
 
 
+def _is_terminal(stream):
+    """Whether the stream says it is a terminal.
+
+    Only a terminal is redrawn in place, because a rewritten line is a line a
+    log or a pipe never keeps. A stream that cannot answer - one that is
+    closed, or that is not a file at all - has not said yes, so it is written
+    to a line at a time like any other.
+    """
+    try:
+        return bool(stream.isatty())
+    except Exception:
+        return False
+
+
 class ProgressReporter:
     """Writes one self-contained line per milestone.
 
@@ -47,10 +61,42 @@ class ProgressReporter:
         self._min_interval = min_interval
         self._min_bytes = min_bytes
         self._download = None
+        self._terminal = _is_terminal(stream)
+        self._live = None
+
+    def _settle(self):
+        """End the in-place line, once, before anything else claims the cursor.
+
+        Every other milestone owns a line of its own, so an update that is
+        still being redrawn has to become a finished line first - otherwise
+        the next milestone would be written over what it is meant to follow.
+        """
+        if self._live is None:
+            return
+        self._live = None
+        self._stream.write("\n")
 
     def _write(self, ctf, message):
+        self._settle()
         self._stream.write(f"[{display_text(ctf, 60)}] {message}\n")
         self._stream.flush()
+
+    def _update(self, ctf, message):
+        """Redraw the in-place line a terminal keeps for the current download.
+
+        A carriage return is the whole vocabulary: it returns to the start of
+        the line we already own, so nothing here can move the cursor off it.
+        An update that is shorter than the one it replaces would otherwise
+        leave the tail of the old text standing, so the difference is written
+        over with spaces rather than erased with a cursor control sequence.
+        """
+        line = f"[{display_text(ctf, 60)}] {message}"
+        if self._live is None:
+            self._stream.write(line)
+        else:
+            self._stream.write(f"\r{line}{' ' * max(0, self._live - len(line))}")
+        self._stream.flush()
+        self._live = len(line)
 
     @staticmethod
     def _path(event):
@@ -143,7 +189,8 @@ class ProgressReporter:
         elapsed = now - state["started"]
         if elapsed > 0:
             transferred += f" {format_bytes(received / elapsed)}/s"
-        self._write(event["ctf"], f"{self._path(event)} {transferred}")
+        emit = self._update if self._terminal else self._write
+        emit(event["ctf"], f"{self._path(event)} {transferred}")
 
     def _on_attachment_done(self, event):
         state = self._download
