@@ -65,6 +65,45 @@ class SyncProgressWiringTests(unittest.TestCase):
         self.assertIsNotNone(collect_all.call_args.kwargs["progress"])
         self.assertIsNone(collect_all.call_args.kwargs["limit_approver"])
 
+    def download(self, reporter, received=32 * 1024 * 1024):
+        """A download far past every default throttle, start to finish."""
+        path = "web/1-One/files/a.bin"
+        declared = 64 * 1024 * 1024
+        for event in (
+            {"event": "attachment_start", "declared": declared},
+            {"event": "attachment_progress", "received": received, "declared": declared},
+            {"event": "attachment_done", "size": declared, "status": "downloaded"},
+        ):
+            reporter({"ctf": "probe", "local_path": path, **event})
+
+    def test_a_captured_stderr_gets_no_in_flight_download_line(self):
+        # The wired reporter carries the real thresholds, and 32 MiB clears
+        # them, so a line here would be a line every redirected run keeps.
+        _code, collect_all, stdout, stderr = self.call_sync()
+
+        self.download(collect_all.call_args.kwargs["progress"])
+
+        lines = stderr.getvalue().splitlines()
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(
+            lines[0],
+            "[probe] downloading web/1-One/files/a.bin (64.0 MiB)",
+        )
+        self.assertTrue(
+            lines[-1].startswith("[probe] saved web/1-One/files/a.bin (64.0 MiB in "),
+            lines,
+        )
+        self.assertEqual(len(lines), 2, lines)
+
+    def test_a_terminal_still_watches_the_download_in_flight(self):
+        # The suppression is about what a log keeps, not about what an
+        # operator can see, so the terminal run keeps its live percentage.
+        _code, collect_all, _stdout, stderr = self.call_sync(stdout=True, stderr=True)
+
+        self.download(collect_all.call_args.kwargs["progress"])
+
+        self.assertIn("32.0 MiB/64.0 MiB (50%)", stderr.getvalue())
+
     def test_the_reporter_writes_to_stderr_and_never_to_stdout(self):
         _code, collect_all, stdout, stderr = self.call_sync()
 

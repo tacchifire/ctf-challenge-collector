@@ -30,9 +30,9 @@ def _is_terminal(stream):
     """Whether the stream says it is a terminal.
 
     Only a terminal is redrawn in place, because a rewritten line is a line a
-    log or a pipe never keeps. A stream that cannot answer - one that is
-    closed, or that is not a file at all - has not said yes, so it is written
-    to a line at a time like any other.
+    log or a pipe never keeps, and only a terminal is shown a download in
+    flight at all. A stream that cannot answer - one that is closed, or that
+    is not a file at all - has not said yes, so it is treated as a log.
     """
     try:
         return bool(stream.isatty())
@@ -44,8 +44,11 @@ class ProgressReporter:
     """Writes one self-contained line per milestone.
 
     A download that takes minutes still has to look alive, but a line per
-    chunk would bury everything else, so in-flight lines are released by
+    chunk would bury everything else, so in-flight updates are released by
     elapsed time or transferred bytes while start and end are unconditional.
+    A terminal draws those updates over one line it can reclaim; anywhere
+    else they are dropped, because a log keeps every line it is given and
+    nothing an update says outlives the result that follows it.
     """
 
     def __init__(
@@ -167,6 +170,13 @@ class ProgressReporter:
         self._write(event["ctf"], f"downloading {self._path(event)} ({size})")
 
     def _on_attachment_progress(self, event):
+        """Show the download moving, on the one stream that can take it back.
+
+        The clock reading and the pacing are kept off a terminal too: the
+        callback is the only place the reporter observes the clock, and the
+        duration the result reports is measured from what it observed there.
+        Only the line is withheld.
+        """
         state = self._download
         if state is None:
             return
@@ -179,6 +189,8 @@ class ProgressReporter:
             return
         state["last_emit"] = now
         state["last_bytes"] = received
+        if not self._terminal:
+            return
 
         declared = event.get("declared")
         transferred = format_bytes(received)
@@ -189,8 +201,7 @@ class ProgressReporter:
         elapsed = now - state["started"]
         if elapsed > 0:
             transferred += f" {format_bytes(received / elapsed)}/s"
-        emit = self._update if self._terminal else self._write
-        emit(event["ctf"], f"{self._path(event)} {transferred}")
+        self._update(event["ctf"], f"{self._path(event)} {transferred}")
 
     def _on_attachment_done(self, event):
         state = self._download

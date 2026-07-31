@@ -1,4 +1,5 @@
 from io import StringIO
+import os
 import unittest
 
 from ctf_collector.progress import ProgressReporter
@@ -50,6 +51,26 @@ class ReporterHarness(unittest.TestCase):
     @staticmethod
     def lines(stream):
         return stream.getvalue().splitlines()
+
+
+class FakeTerminal(StringIO):
+    """A stream that claims to be a terminal, so raw control bytes stay visible."""
+
+    def isatty(self):
+        return True
+
+
+class TerminalHarness(ReporterHarness):
+    """In-flight updates exist only on a terminal, so their pacing is tested there."""
+
+    def make(self, **kwargs):
+        stream = FakeTerminal()
+        clock = FakeClock()
+        reporter = ProgressReporter(stream, now=clock, **kwargs)
+        return reporter, stream, clock
+
+
+TERMINAL_PATH = "pwn/1-One/files/big.bin"
 
 
 class ReporterStructureTests(ReporterHarness):
@@ -177,34 +198,6 @@ class AttachmentProgressTests(ReporterHarness):
 
         self.assertEqual(len(self.lines(stream)), 1, stream.getvalue())
 
-    def test_elapsed_time_releases_one_progress_line(self):
-        reporter, stream, clock = self.make_download(
-            min_interval=1.0,
-            min_bytes=4 * MIB,
-        )
-        self.progress(reporter, 1024)
-        clock.advance(2.0)
-
-        self.progress(reporter, 2 * MIB)
-        self.progress(reporter, 2 * MIB + 1024)
-
-        self.assertEqual(len(self.lines(stream)), 2, stream.getvalue())
-        self.assertEqual(
-            self.lines(stream)[1],
-            "[x] pwn/1-One/files/big.bin 2.0 MiB/10.0 MiB (20%) 1.0 MiB/s",
-        )
-
-    def test_transferred_bytes_release_a_progress_line_without_the_clock(self):
-        reporter, stream, _clock = self.make_download(
-            min_interval=60.0,
-            min_bytes=4 * MIB,
-        )
-
-        self.progress(reporter, 4 * MIB)
-
-        self.assertEqual(len(self.lines(stream)), 2, stream.getvalue())
-        self.assertIn("4.0 MiB/10.0 MiB (40%)", self.lines(stream)[1])
-
     def test_completion_always_prints_even_when_throttled(self):
         reporter, stream, _clock = self.make_download(
             min_interval=3600.0,
@@ -267,24 +260,8 @@ class AttachmentProgressTests(ReporterHarness):
         )
 
 
-class FakeTerminal(StringIO):
-    """A stream that claims to be a terminal, so raw control bytes stay visible."""
-
-    def isatty(self):
-        return True
-
-
-TERMINAL_PATH = "pwn/1-One/files/big.bin"
-
-
-class TerminalProgressLineTests(ReporterHarness):
+class TerminalProgressLineTests(TerminalHarness):
     """On a terminal one download owns one line until that line is settled."""
-
-    def make(self, **kwargs):
-        stream = FakeTerminal()
-        clock = FakeClock()
-        reporter = ProgressReporter(stream, now=clock, **kwargs)
-        return reporter, stream, clock
 
     def start(self, reporter, path=TERMINAL_PATH):
         reporter(
@@ -306,6 +283,30 @@ class TerminalProgressLineTests(ReporterHarness):
                 "declared": 10 * MIB,
             }
         )
+
+    def test_elapsed_time_releases_one_update(self):
+        reporter, stream, clock = self.make(min_interval=1.0, min_bytes=4 * MIB)
+        self.start(reporter)
+        self.progress(reporter, 1024)
+        clock.advance(2.0)
+
+        self.progress(reporter, 2 * MIB)
+        self.progress(reporter, 2 * MIB + 1024)
+
+        self.assertEqual(len(self.lines(stream)), 2, stream.getvalue())
+        self.assertEqual(
+            self.lines(stream)[1],
+            f"[x] {TERMINAL_PATH} 2.0 MiB/10.0 MiB (20%) 1.0 MiB/s",
+        )
+
+    def test_transferred_bytes_release_an_update_without_the_clock(self):
+        reporter, stream, _clock = self.make(min_interval=60.0, min_bytes=4 * MIB)
+        self.start(reporter)
+
+        self.progress(reporter, 4 * MIB)
+
+        self.assertEqual(len(self.lines(stream)), 2, stream.getvalue())
+        self.assertIn("4.0 MiB/10.0 MiB (40%)", self.lines(stream)[1])
 
     def test_repeated_progress_rewrites_one_line_instead_of_adding_lines(self):
         reporter, stream, clock = self.make(min_interval=1.0, min_bytes=4 * MIB)
@@ -433,47 +434,176 @@ class ClosedStream(RecordingStream):
         raise ValueError("I/O operation on closed file")
 
 
-class UnanswerableTerminalTests(unittest.TestCase):
-    """In-place updates need a terminal's word for it, not a guess.
+class NonTerminalStreamTests(ReporterHarness):
+    """Off a terminal an attachment shows its start and its result, nothing between.
 
-    A stream that cannot say whether it is one is treated as a plain stream,
-    because a line rewritten into a log or a pipe is a line that was lost.
+    Redrawing a line needs a terminal, so an in-flight update off one could
+    only be appended as a line of its own, and a log, a pipe or a captured
+    run would then keep one line per throttle tick for the whole of a long
+    download. Everything that outlives the transfer is on the two lines that
+    bracket it, so the updates are dropped rather than accumulated.
     """
 
-    def test_a_stream_that_cannot_answer_isatty_keeps_writing_plain_lines(self):
+    def start(self, reporter, declared=10 * MIB):
+        reporter(
+            {
+                "event": "attachment_start",
+                "ctf": "x",
+                "local_path": TERMINAL_PATH,
+                "declared": declared,
+            }
+        )
+
+    def progress(self, reporter, received, declared=10 * MIB):
+        reporter(
+            {
+                "event": "attachment_progress",
+                "ctf": "x",
+                "local_path": TERMINAL_PATH,
+                "received": received,
+                "declared": declared,
+            }
+        )
+
+    def flood(self, reporter, clock, *, ticks=6):
+        """Every reason the reporter has to speak, spent at once.
+
+        The thresholds are off, minutes pass between chunks and megabytes
+        arrive with them, so anything printed here is printed by the contract
+        rather than by the pacing.
+        """
+        self.start(reporter)
+        for tick in range(1, ticks + 1):
+            clock.advance(60.0)
+            self.progress(reporter, tick * MIB)
+
+    def done(self, reporter):
+        reporter(
+            {
+                "event": "attachment_done",
+                "ctf": "x",
+                "local_path": TERMINAL_PATH,
+                "size": 10 * MIB,
+                "status": "downloaded",
+            }
+        )
+
+    def test_no_update_reaches_a_captured_stream_between_start_and_done(self):
+        reporter, stream, clock = self.make(min_interval=0.0, min_bytes=0)
+
+        self.flood(reporter, clock)
+        self.done(reporter)
+
+        self.assertEqual(
+            self.lines(stream),
+            [
+                f"[x] downloading {TERMINAL_PATH} (10.0 MiB)",
+                f"[x] saved {TERMINAL_PATH} (10.0 MiB in 360.0s)",
+            ],
+        )
+        self.assertNotIn("\r", stream.getvalue())
+
+    def test_no_update_reaches_a_captured_stream_before_a_failure(self):
+        reporter, stream, clock = self.make(min_interval=0.0, min_bytes=0)
+
+        self.flood(reporter, clock)
+        reporter(
+            {
+                "event": "attachment_failed",
+                "ctf": "x",
+                "local_path": TERMINAL_PATH,
+                "code": "file_too_large",
+            }
+        )
+
+        self.assertEqual(
+            self.lines(stream),
+            [
+                f"[x] downloading {TERMINAL_PATH} (10.0 MiB)",
+                f"[x] failed {TERMINAL_PATH} (file_too_large)",
+            ],
+        )
+
+    def test_an_unknown_size_does_not_earn_an_update_either(self):
+        # Without a declared size there is no percentage to withhold, and the
+        # received count is still not worth a line of log per tick.
+        reporter, stream, clock = self.make(min_interval=0.0, min_bytes=0)
+
+        self.start(reporter, declared=None)
+        for tick in range(1, 4):
+            clock.advance(60.0)
+            self.progress(reporter, tick * MIB, declared=None)
+
+        self.assertEqual(
+            self.lines(stream),
+            [f"[x] downloading {TERMINAL_PATH} (size unknown)"],
+        )
+
+    def test_a_pipe_carries_the_start_and_the_result_only(self):
+        read_fd, write_fd = os.pipe()
+        clock = FakeClock()
+        writer = open(write_fd, "w", encoding="utf-8")
+        try:
+            reporter = ProgressReporter(
+                writer,
+                now=clock,
+                min_interval=0.0,
+                min_bytes=0,
+            )
+            self.flood(reporter, clock)
+            self.done(reporter)
+        finally:
+            writer.close()
+        with open(read_fd, "r", encoding="utf-8") as reader:
+            text = reader.read()
+
+        self.assertEqual(
+            text.splitlines(),
+            [
+                f"[x] downloading {TERMINAL_PATH} (10.0 MiB)",
+                f"[x] saved {TERMINAL_PATH} (10.0 MiB in 360.0s)",
+            ],
+        )
+
+    def test_a_stream_that_cannot_answer_isatty_is_not_a_terminal(self):
+        """A stream that has not said yes is written to as a log, so it stays quiet."""
         for stream in (RecordingStream(), ClosedStream()):
             with self.subTest(stream=type(stream).__name__):
+                clock = FakeClock()
                 reporter = ProgressReporter(
                     stream,
-                    now=FakeClock(),
+                    now=clock,
                     min_interval=0.0,
                     min_bytes=0,
                 )
 
-                reporter(
-                    {
-                        "event": "attachment_start",
-                        "ctf": "x",
-                        "local_path": TERMINAL_PATH,
-                        "declared": 10 * MIB,
-                    }
-                )
-                for received in (MIB, 2 * MIB):
-                    reporter(
-                        {
-                            "event": "attachment_progress",
-                            "ctf": "x",
-                            "local_path": TERMINAL_PATH,
-                            "received": received,
-                            "declared": 10 * MIB,
-                        }
-                    )
+                self.flood(reporter, clock)
 
                 self.assertNotIn("\r", stream.text)
-                self.assertEqual(len(stream.text.splitlines()), 3, stream.text)
+                self.assertEqual(
+                    stream.text.splitlines(),
+                    [f"[x] downloading {TERMINAL_PATH} (10.0 MiB)"],
+                )
+
+    def test_a_silent_download_is_still_measured_from_the_clock_it_observed(self):
+        # Dropping the updates drops what they printed, not what they taught
+        # the reporter: a backwards clock is still rebased at the callback.
+        reporter, stream, clock = self.make(min_interval=0.0, min_bytes=0)
+        clock.advance(10.0)
+        self.start(reporter)
+        clock.advance(-5.0)
+        self.progress(reporter, 1024)
+        clock.advance(3.0)
+
+        self.done(reporter)
+
+        self.assertEqual(
+            self.lines(stream)[-1],
+            f"[x] saved {TERMINAL_PATH} (10.0 MiB in 3.0s)",
+        )
 
 
-class UnknownLengthTests(ReporterHarness):
+class UnknownLengthTests(TerminalHarness):
     def test_start_without_content_length_says_the_size_is_unknown(self):
         reporter, stream, _clock = self.make()
 
@@ -519,7 +649,7 @@ class UnknownLengthTests(ReporterHarness):
         )
 
 
-class BackwardsClockTests(ReporterHarness):
+class BackwardsClockTests(TerminalHarness):
     """A clock that moves backwards must not stall or misreport a download.
 
     `time.monotonic` is per-process, so a reporter handed any other clock can
