@@ -26,6 +26,13 @@ SENSITIVE_KEY_PARTS = {
     "secret",
     "token",
 }
+WITHHELD = "[REDACTED]"
+SAFE_COMPONENT = "redacted"
+DISPLAY_PUNCTUATION = frozenset(" !\"&'(),-.:;+@_")
+# How many collision suffixes one candidate name may be asked for before the
+# next candidate is tried instead. A secret that survives every suffix of one
+# name is a name we should stop spelling, not one to keep counting on.
+SAFE_NAME_ATTEMPTS = 8
 
 
 def sanitize_component(value, fallback="unnamed", max_length=120):
@@ -66,13 +73,88 @@ def sanitize_component(value, fallback="unnamed", max_length=120):
     return result
 
 
+def display_text(value, max_length=80):
+    """Text that is safe to write to a terminal.
+
+    Progress output interleaves attacker-influenced names with our own labels,
+    so a name must never be able to end the line, move the cursor, or start an
+    escape sequence. Only a plain space survives from the whitespace class.
+    """
+    value = unicodedata.normalize("NFKC", str(value))
+    cleaned = []
+    for character in value:
+        if character != " " and (
+            character.isspace()
+            or unicodedata.category(character).startswith("C")
+        ):
+            cleaned.append("_")
+        else:
+            cleaned.append(character)
+    result = "".join(cleaned)
+    if len(result) > max_length:
+        result = result[: max(0, max_length - 3)] + "..."
+    return result
+
+
+def display_name(value, max_length=80):
+    """A value chosen by the API that is safe to name on the terminal.
+
+    The display boundary is closed by default: only a plain scalar of ordinary
+    text survives. A mapping or a list is a structure we never meant to print,
+    and a value shaped like a URL, a query, a fragment or a flag carries the
+    very thing the display exists to withhold, so those are replaced whole
+    instead of being trimmed into something that merely looks harmless.
+    """
+    if not isinstance(value, (str, int, float)):
+        return WITHHELD
+    text = unicodedata.normalize("NFKC", str(value))
+    if any(
+        character not in DISPLAY_PUNCTUATION
+        and not character.isalnum()
+        and not unicodedata.category(character).startswith("M")
+        for character in text
+    ):
+        return WITHHELD
+    return display_text(text, max_length)
+
+
+def display_path(value, max_length=80):
+    """An output path that is safe to name on the terminal.
+
+    A path describes our own layout, so unlike a name it keeps its separators.
+    A query or a fragment is never part of that layout, so both are dropped:
+    otherwise a signed URL smuggled into a file name would put its signature
+    on the terminal.
+    """
+    text = str(value)
+    for separator in ("?", "#"):
+        text = text.split(separator, 1)[0]
+    return display_text(text, max_length)
+
+
 def ctf_directory_name(name):
     return sanitize_component(name, "ctf")
 
 
-def unique_name(name, used):
+def temporary_output_name(name):
+    """The name a document is written under while it is not yet the document.
+
+    It is derived from the target rather than chosen, so every caller that has
+    to reason about what reaches the disk - the writer here and the boundary
+    that settles a name before the write - derives it the same way.
+    """
+    return f".{name}.part"
+
+
+def unique_name(name, used, *, keep_extension=True):
+    """The first spelling of `name` that this directory has not used yet.
+
+    An attachment keeps its extension, so the suffix goes before it rather
+    than changing what the file claims to be. A directory has no extension to
+    keep, so the suffix goes at the end of it.
+    """
     candidate = name
-    stem, suffix = os.path.splitext(name)
+    stem, suffix = os.path.splitext(name) if keep_extension else (name, "")
     counter = 2
     while candidate.casefold() in used:
         candidate = f"{stem}__{counter}{suffix}"
@@ -108,11 +190,148 @@ def redact_url(url, *, force=False):
 
 
 def redact_secrets(value, secrets=()):
+    """Remove every secret, including the spellings that only look different.
+
+    Names travel on to `sanitize_component` and to the display, and both
+    normalize first, so a token written in a compatibility form is the token:
+    it is redacted here rather than reconstituted downstream. Text that holds
+    no secret keeps its own spelling, because normalizing it would rewrite a
+    value we were only asked to inspect.
+    """
     result = str(value)
     for secret in secrets:
-        if secret:
-            result = result.replace(str(secret), "[REDACTED]")
+        if not secret:
+            continue
+        secret = str(secret)
+        result = result.replace(secret, WITHHELD)
+        normalized = unicodedata.normalize("NFKC", result)
+        if secret in normalized:
+            result = normalized.replace(secret, WITHHELD)
     return result
+
+
+def _spells_secret(component, secrets):
+    """Whether an already sanitized component spells a secret.
+
+    `sanitize_component` normalized it, so the component's own spelling is the
+    last one left to check.
+    """
+    return any(secret and str(secret) in component for secret in secrets)
+
+
+def sanitize_component_without_secrets(
+    value,
+    secrets=(),
+    fallback="unnamed",
+    max_length=120,
+):
+    """A path component that cannot spell a secret, however it was written.
+
+    Redacting before sanitizing is not enough on its own, because sanitizing
+    folds a run of separators: `abc__def` and `abc//def` both come out of it
+    spelling a token written `abc_def` that redaction never had the chance to
+    match. So the component is checked once more afterwards, and one that
+    spells a secret is replaced whole - trimming it would keep the very part
+    we withheld. A fallback is a name like any other, so it is checked the
+    same way, and when nothing is left to name the component with we refuse
+    instead of writing the secret into a path.
+    """
+    candidates = (
+        sanitize_component(redact_secrets(value, secrets), fallback, max_length),
+        sanitize_component(fallback, SAFE_COMPONENT, max_length),
+        SAFE_COMPONENT,
+    )
+    for candidate in candidates:
+        if not _spells_secret(candidate, secrets):
+            return candidate
+    raise CollectorError(
+        "unsafe_name",
+        "cannot name an output path without disclosing a token",
+    )
+
+
+def path_spells_secret(parts, secrets=()):
+    """Whether the finished path spells a secret no component spells alone.
+
+    A component is checked on its own, but what gets written, recorded and
+    displayed is the whole path, and the joins are ours: an id joined to a
+    name, a category joined to a directory, a directory joined to the file
+    beneath it. Any of them can complete a token that no single component ever
+    contained. Each component was normalized as it was sanitized and the
+    separators are plain ASCII, so the join carries no new spelling of its
+    own - the normalized form is checked all the same, because a path that
+    only needs normalizing to spell the token is the token.
+    """
+    joined = "/".join(str(part) for part in parts)
+    return _spells_secret(joined, secrets) or _spells_secret(
+        unicodedata.normalize("NFKC", joined),
+        secrets,
+    )
+
+
+def _name_candidates(preferred, seed, fallback, max_length):
+    """Bounded deterministic names for one component, most wanted first.
+
+    The name the input asked for keeps the tree readable, so it is tried
+    first. What follows carries a digest of that same input: it names the
+    component without quoting it, it is the same on every run so a second
+    collection recognizes what the first one wrote, and it keeps two
+    challenges apart where the bare fallback word would merge them.
+    """
+    digest = hashlib.sha256(str(seed).encode("utf-8")).hexdigest()[:16]
+    return (
+        preferred,
+        sanitize_component(f"{fallback}_{digest}", SAFE_COMPONENT, max_length),
+        f"{SAFE_COMPONENT}_{digest}",
+        sanitize_component(fallback, SAFE_COMPONENT, max_length),
+        SAFE_COMPONENT,
+    )
+
+
+def safe_unique_component(
+    parent_parts,
+    preferred,
+    used,
+    secrets=(),
+    *,
+    fallback="unnamed",
+    seed=None,
+    children=(),
+    siblings=(),
+    keep_extension=True,
+    max_length=120,
+):
+    """A name that is unique here and leaves no path here spelling a secret.
+
+    The component is chosen for the paths it completes rather than for itself:
+    the parent it hangs under, the fixed children written beneath it, the
+    temporary names derived from it beside it and the suffix that resolves a
+    collision are all part of what reaches the disk, so all of them are
+    checked, and they are checked after the suffix is chosen rather than
+    before. A name that completes a secret is passed over for the next
+    candidate; when the bounded list of candidates runs out we refuse, because
+    a path we cannot name safely is one we must not write.
+    """
+    seed = preferred if seed is None else seed
+    for candidate in _name_candidates(preferred, seed, fallback, max_length):
+        # `unique_name` reserves what it hands back, so asking a copy of the
+        # reservations again yields the next suffix rather than the name that
+        # was just refused.
+        offered = set(used)
+        for _attempt in range(SAFE_NAME_ATTEMPTS):
+            name = unique_name(candidate, offered, keep_extension=keep_extension)
+            paths = [(*parent_parts, name)]
+            paths.extend((*parent_parts, name, *child) for child in children)
+            paths.extend(
+                (*parent_parts, f"{name}{suffix}") for suffix in siblings
+            )
+            if not any(path_spells_secret(path, secrets) for path in paths):
+                used.add(name.casefold())
+                return name
+    raise CollectorError(
+        "unsafe_name",
+        "cannot name an output path without disclosing a token",
+    )
 
 
 def _normalized_key_parts(key):
@@ -541,7 +760,7 @@ class SafeOutput:
             )
             + "\n"
         ).encode("utf-8")
-        temporary_name = f".{parts[-1]}.part"
+        temporary_name = temporary_output_name(parts[-1])
         directory = None
         try:
             directory, descriptor, identity = self.open_temporary(

@@ -19,20 +19,78 @@ from .config import (
 from .errors import CollectorError
 from .http import HttpClient, normalized_origin
 from .safety import (
+    display_name,
     filename_from_url,
+    path_spells_secret,
     redact_url,
     redact_secrets,
     SafeOutput,
     safe_metadata,
-    sanitize_component,
+    safe_unique_component,
+    sanitize_component_without_secrets,
     ctf_directory_name,
-    unique_name,
+    temporary_output_name,
 )
 
 
 RCTF_LIST_PATHS = ("/api/v1/challs", "/api/v1/challenges", "/api/challs")
 MAX_TOKEN_BYTES = 64 * 1024
 SOURCE_IDENTITY_CONTEXT = b"ctf-challenge-collector source identity\x00"
+MANIFEST_NAME = "manifest.json"
+CHALLENGE_NAME = "challenge.json"
+# What every run writes at a fixed place below a directory it named. A name is
+# settled against these as well as against itself, because the join is ours and
+# it is the finished path that reaches the disk.
+CTF_DIRECTORY_CHILDREN = (
+    (MANIFEST_NAME,),
+    (temporary_output_name(MANIFEST_NAME),),
+)
+CHALLENGE_DIRECTORY_CHILDREN = (
+    (CHALLENGE_NAME,),
+    (temporary_output_name(CHALLENGE_NAME),),
+    ("files",),
+)
+# An attachment is written beside its target rather than beneath it, so its
+# temporary name is a suffix of the name we are choosing.
+ATTACHMENT_TEMPORARY_SUFFIX = ".part"
+
+
+class _SafeProgress:
+    """Fail-open wrapper around a caller-supplied reporter.
+
+    Progress is a display, not part of the result, so a reporter that raises
+    must never cost us a collection. One that failed once will keep failing,
+    so it is dropped instead of being retried on every chunk.
+    """
+
+    def __init__(self, callback):
+        self._callback = callback
+
+    def __call__(self, event):
+        callback = self._callback
+        if callback is None:
+            return
+        try:
+            callback(event)
+        except Exception:
+            self._callback = None
+
+
+def _safe_progress(callback):
+    if callback is None or isinstance(callback, _SafeProgress):
+        return callback
+    return _SafeProgress(callback)
+
+
+def _notify(progress, event, **fields):
+    """Report a milestone so a long run never looks hung.
+
+    Only values that already passed redaction reach the reporter, because the
+    display is as public as any other terminal output.
+    """
+    if progress is None:
+        return
+    progress({"event": event, **fields})
 
 
 def _collection(payload):
@@ -274,6 +332,7 @@ def _download(
     ctf_name,
     local_path,
     limit_approver=None,
+    progress=None,
 ):
     effective_file_limit = _runtime_limit(
         limits,
@@ -286,7 +345,7 @@ def _download(
         MAX_TOTAL_BYTES,
     )
     response, final_url = client.open_get(url, attachment=True)
-    temporary_name = f"{target_name}.part"
+    temporary_name = f"{target_name}{ATTACHMENT_TEMPORARY_SUFFIX}"
     directory = None
     try:
         declared = None
@@ -345,6 +404,13 @@ def _download(
         )
         digest = hashlib.sha256()
         size = 0
+        _notify(
+            progress,
+            "attachment_start",
+            ctf=ctf_name,
+            local_path=local_path,
+            declared=declared,
+        )
         try:
             with os.fdopen(descriptor, "wb") as stream:
                 while True:
@@ -352,6 +418,14 @@ def _download(
                     if not chunk:
                         break
                     size += len(chunk)
+                    _notify(
+                        progress,
+                        "attachment_progress",
+                        ctf=ctf_name,
+                        local_path=local_path,
+                        received=size,
+                        declared=declared,
+                    )
                     if size > effective_file_limit:
                         raise CollectorError(
                             "file_too_large", "attachment exceeds file limit"
@@ -643,12 +717,27 @@ def _fetch_rctf(client, failures):
 
 
 def _validated_ctf_directory(config, secrets):
-    if any(secret and secret in config["name"] for secret in secrets):
+    # The directory is checked as well as the name it came from: sanitizing
+    # normalizes, so a token spelled in a compatibility form reaches the
+    # filesystem as the token even though the configured name never matched it.
+    # The manifest and the name it is written under first are checked with it,
+    # because a directory that only completes a token once its own fixed files
+    # hang under it still writes the token to the disk. This name comes from
+    # the configuration rather than from the API, so there is no next candidate
+    # to fall back to: we refuse here, before an output tree exists.
+    directory_name = ctf_directory_name(config["name"])
+    paths = [
+        (directory_name,),
+        *((directory_name, *child) for child in CTF_DIRECTORY_CHILDREN),
+    ]
+    if any(secret and secret in config["name"] for secret in secrets) or any(
+        path_spells_secret(path, secrets) for path in paths
+    ):
         raise CollectorError(
             "invalid_config",
             "CTF name must not contain an authentication token",
         )
-    return ctf_directory_name(config["name"])
+    return directory_name
 
 
 def _preflight_configs(configs):
@@ -669,7 +758,8 @@ def _preflight_configs(configs):
     return tokens
 
 
-def collect_ctf(config, *, _token=None, limit_approver=None):
+def collect_ctf(config, *, _token=None, limit_approver=None, progress=None):
+    progress = _safe_progress(progress)
     token = _read_token(config["token_file"]) if _token is None else _token
     ctf_name = _validated_ctf_directory(config, (token,))
     limits = dict(config["limits"])
@@ -702,16 +792,23 @@ def collect_ctf(config, *, _token=None, limit_approver=None):
     ctf_parts = (ctf_name,)
     with SafeOutput(config["output_root"]) as output:
         output.ensure_directory(ctf_parts)
-        manifest_parts = (*ctf_parts, "manifest.json")
+        manifest_parts = (*ctf_parts, MANIFEST_NAME)
         old_files = _read_old_manifest(output, manifest_parts)
         failures = []
+        _notify(
+            progress,
+            "listing_start",
+            ctf=ctf_name,
+            platform=config["platform"],
+        )
         if config["platform"] == "ctfd":
             raw_challenges = _fetch_ctfd(client, limits, failures)
         else:
             raw_challenges = _fetch_rctf(client, failures)
+        _notify(progress, "listing_done", ctf=ctf_name, count=len(raw_challenges))
 
         prepared = []
-        used_directories = set()
+        used_directories = {}
         for raw in raw_challenges:
             challenge_id = redact_secrets(_challenge_id(raw), (token,))
             name = safe_metadata(
@@ -723,35 +820,40 @@ def collect_ctf(config, *, _token=None, limit_approver=None):
                 secrets=(token,),
             )
             base_directory = (
-                f"{sanitize_component(challenge_id, 'id')}-"
-                f"{sanitize_component(name, 'challenge')}"
+                f"{sanitize_component_without_secrets(challenge_id, (token,), 'id')}-"
+                f"{sanitize_component_without_secrets(name, (token,), 'challenge')}"
             )
-            key = (
-                sanitize_component(category, "uncategorized").casefold(),
-                base_directory.casefold(),
+            category_name = sanitize_component_without_secrets(
+                category,
+                (token,),
+                "uncategorized",
             )
-            directory_name = base_directory
-            counter = 2
-            while key in used_directories:
-                directory_name = f"{base_directory}__{counter}"
-                key = (
-                    sanitize_component(category, "uncategorized").casefold(),
-                    directory_name.casefold(),
-                )
-                counter += 1
-            used_directories.add(key)
+            # Each component is safe by itself; the directory is settled
+            # against the path it completes, including the files that will be
+            # written under it and the suffix that resolves a collision.
+            directory_name = safe_unique_component(
+                (*ctf_parts, category_name),
+                base_directory,
+                used_directories.setdefault(category_name.casefold(), set()),
+                (token,),
+                fallback="challenge",
+                seed=f"{challenge_id}/{name}",
+                children=CHALLENGE_DIRECTORY_CHILDREN,
+                keep_extension=False,
+            )
             prepared.append(
                 {
                     "id": challenge_id,
                     "name": name,
                     "category": category,
+                    "category_name": category_name,
                     "directory_name": directory_name,
                     "raw": raw,
                 }
             )
         prepared.sort(
             key=lambda item: (
-                sanitize_component(item["category"]).casefold(),
+                item["category_name"].casefold(),
                 item["directory_name"].casefold(),
                 item["id"],
             )
@@ -759,16 +861,24 @@ def collect_ctf(config, *, _token=None, limit_approver=None):
 
         total_used = 0
         manifest_challenges = []
-        for item in prepared:
-            category_name = sanitize_component(item["category"], "uncategorized")
+        for position, item in enumerate(prepared, 1):
+            _notify(
+                progress,
+                "challenge",
+                ctf=ctf_name,
+                index=position,
+                total=len(prepared),
+                name=display_name(item["name"]),
+                category=display_name(item["category"]),
+            )
             challenge_parts = (
                 *ctf_parts,
-                category_name,
+                item["category_name"],
                 item["directory_name"],
             )
             output.ensure_directory(challenge_parts)
             output.atomic_json(
-                (*challenge_parts, "challenge.json"),
+                (*challenge_parts, CHALLENGE_NAME),
                 {
                     "category": item["category"],
                     "id": item["id"],
@@ -790,12 +900,18 @@ def collect_ctf(config, *, _token=None, limit_approver=None):
                 )
             used_filenames = set()
             for attachment in attachments:
-                filename = unique_name(
-                    sanitize_component(
-                        redact_secrets(attachment["name"], (token,)),
+                filename = safe_unique_component(
+                    (*challenge_parts, "files"),
+                    sanitize_component_without_secrets(
+                        attachment["name"],
+                        (token,),
                         "attachment",
                     ),
                     used_filenames,
+                    (token,),
+                    fallback="attachment",
+                    seed=attachment["name"],
+                    siblings=(ATTACHMENT_TEMPORARY_SUFFIX,),
                 )
                 target_parts = (*challenge_parts, "files", filename)
                 local_path = "/".join(target_parts[1:])
@@ -829,6 +945,14 @@ def collect_ctf(config, *, _token=None, limit_approver=None):
                             }
                         )
                         manifest_files.append(entry)
+                        _notify(
+                            progress,
+                            "attachment_done",
+                            ctf=ctf_name,
+                            local_path=local_path,
+                            size=size,
+                            status="verified",
+                        )
                         continue
                 else:
                     error = None
@@ -846,6 +970,7 @@ def collect_ctf(config, *, _token=None, limit_approver=None):
                         ctf_name=ctf_name,
                         local_path=local_path,
                         limit_approver=limit_approver,
+                        progress=progress,
                     )
                     total_used += size
                     entry.update(
@@ -854,6 +979,14 @@ def collect_ctf(config, *, _token=None, limit_approver=None):
                             "size": size,
                             "status": "downloaded",
                         }
+                    )
+                    _notify(
+                        progress,
+                        "attachment_done",
+                        ctf=ctf_name,
+                        local_path=local_path,
+                        size=size,
+                        status="downloaded",
                     )
                 except CollectorError as exc:
                     entry.update(
@@ -869,6 +1002,13 @@ def collect_ctf(config, *, _token=None, limit_approver=None):
                             challenge_id=item["id"],
                             source_url=attachment["url"],
                         )
+                    )
+                    _notify(
+                        progress,
+                        "attachment_failed",
+                        ctf=ctf_name,
+                        local_path=local_path,
+                        code=exc.code,
                     )
                 manifest_files.append(entry)
             manifest_challenges.append(
@@ -902,19 +1042,36 @@ def collect_ctf(config, *, _token=None, limit_approver=None):
         return manifest
 
 
-def collect_all(configs, selected=None, *, limit_approver=None):
+def collect_all(configs, selected=None, *, limit_approver=None, progress=None):
+    progress = _safe_progress(progress)
     if selected is not None:
         configs = [config for config in configs if config["name"] == selected]
         if not configs:
             raise CollectorError("unknown_ctf", f"unknown CTF name: {selected}")
     tokens = _preflight_configs(configs)
     results = []
-    for config, token in zip(configs, tokens):
+    for position, (config, token) in enumerate(zip(configs, tokens), 1):
+        display_name = ctf_directory_name(config["name"])
+        _notify(
+            progress,
+            "ctf_start",
+            ctf=display_name,
+            index=position,
+            total=len(configs),
+        )
         try:
             manifest = collect_ctf(
                 config,
                 _token=token,
                 limit_approver=limit_approver,
+                progress=progress,
+            )
+            _notify(
+                progress,
+                "ctf_done",
+                ctf=display_name,
+                status=manifest["status"],
+                failures=len(manifest.get("failures", ())),
             )
             results.append(
                 {
@@ -925,6 +1082,7 @@ def collect_all(configs, selected=None, *, limit_approver=None):
                 }
             )
         except CollectorError as exc:
+            _notify(progress, "ctf_failed", ctf=display_name, code=exc.code)
             results.append(
                 {
                     "name": config["name"],
@@ -934,6 +1092,7 @@ def collect_all(configs, selected=None, *, limit_approver=None):
                 }
             )
         except OSError as exc:
+            _notify(progress, "ctf_failed", ctf=display_name, code="io_error")
             results.append(
                 {
                     "name": config["name"],

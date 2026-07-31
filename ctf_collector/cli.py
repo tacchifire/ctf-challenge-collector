@@ -7,6 +7,7 @@ import sys
 from .collector import collect_all
 from .config import load_config
 from .errors import CollectorError
+from .progress import ProgressReporter
 
 
 EXAMPLE_CONFIG = {
@@ -82,6 +83,16 @@ def _interactive_limit_approver():
     return None
 
 
+def _stderr_progress():
+    """Narrate the run on stderr, whether or not anyone is watching a terminal.
+
+    Unlike the oversized-attachment prompt, this needs no answer from the
+    operator, so a piped or redirected run keeps the same visibility a
+    terminal gets. stdout stays reserved for the machine-readable summary.
+    """
+    return ProgressReporter(sys.stderr)
+
+
 def main(argv=None):
     args = make_parser().parse_args(argv)
     try:
@@ -94,6 +105,7 @@ def main(argv=None):
             configs,
             selected=args.ctf,
             limit_approver=_interactive_limit_approver(),
+            progress=_stderr_progress(),
         )
         failed = False
         for result in results:
