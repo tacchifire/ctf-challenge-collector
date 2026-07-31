@@ -98,7 +98,10 @@ class RctfProtocolTests(unittest.TestCase):
             self.assertEqual(manifest["status"], "complete")
             self.assertEqual(
                 [urlsplit(item["url"]).path for item in fake.requests],
-                ["/api/v1/challs"],
+                [
+                    "/api/v1/challs",
+                    "/api/v1/integrations/client/config",
+                ],
             )
             metadata_path = (
                 Path(tmp)
@@ -152,6 +155,7 @@ class RctfProtocolTests(unittest.TestCase):
                     "/api/v1/challs",
                     "/api/v1/challenges",
                     "/api/v1/challenges/fork",
+                    "/api/v1/integrations/client/config",
                 ],
             )
 
@@ -282,7 +286,7 @@ class CtfdHiddenSummaryTests(unittest.TestCase):
             )
             self.assertEqual(
                 [urlsplit(item["url"]).path for item in fake.requests],
-                ["/api/v1/challenges"],
+                ["/api/v1/challenges", "/rules"],
             )
             self.assertEqual(manifest["challenges"][0]["id"], "0")
             self.assertEqual(manifest["challenges"][0]["name"], "Hidden")

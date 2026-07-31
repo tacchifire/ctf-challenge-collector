@@ -1,6 +1,8 @@
 import errno
+from html import unescape
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -20,23 +22,159 @@ WINDOWS_DEVICE_NAMES = {
     *(f"LPT{number}" for number in range(1, 10)),
 }
 SENSITIVE_KEY_PARTS = {
+    "auth",
+    "authentication",
     "authorization",
     "cookie",
+    "csrf",
+    "email",
+    "nonce",
     "password",
     "secret",
+    "session",
     "token",
+    "user",
 }
+SENSITIVE_COMPOUND_KEY_RE = re.compile(
+    r"(?:"
+    r"access(?:token)"
+    r"|api(?:key)"
+    r"|(?:auth|authentication|authorization|cookie|csrf|email|nonce|password|secret|session|token|user)"
+    r"(?:address|data|hash|id|key|name|token|value)"
+    r")\Z"
+)
 WITHHELD = "[REDACTED]"
 SAFE_COMPONENT = "redacted"
+# The first spelling is the established public marker. The later spellings
+# are fixed alternatives rather than transformations of a credential; an
+# empty final candidate is a finite fail-safe because no configured token is
+# empty. This lets a token literally equal to (or contained by) one marker be
+# removed without replacing it with itself.
+REDACTION_MARKERS = (
+    WITHHELD,
+    "[WITHHELD]",
+    "[FILTERED]",
+    "[HIDDEN]",
+    "\ufffd",
+    "",
+)
 DISPLAY_PUNCTUATION = frozenset(" !\"&'(),-.:;+@_")
+SOURCE_URL_RE = re.compile(
+    r"(?:"
+    # A scheme-relative authority may immediately follow prose (`x//...`).
+    # Requiring userinfo keeps that exception narrow while ensuring its
+    # credential cannot hide behind the usual word-boundary guard.
+    r"[\\/]{2,}[^\s<>\"']*?@[^\s<>\"']+"
+    r"|(?<![A-Za-z0-9_])(?:"
+    # WHATWG treats slashes and backslashes after an HTTP scheme as authority
+    # separators, including when there are zero, one, or too many of them.
+    r"(?:https?:[\\/]*|[A-Za-z][A-Za-z0-9+.-]*://|//|\.\.?/|/)"
+    r"[^\s<>\"']+"
+    r"|(?:[A-Za-z0-9._~%-]+/)+[A-Za-z0-9._~%/-]+[?#][^\s<>\"']+"
+    r"|[A-Za-z0-9_~%-]+\.[A-Za-z0-9._~%-]+[?#][^\s<>\"']+"
+    # A destination needs neither a slash nor a dot to carry a credential:
+    # `download?credential=...` is one word and a query. This alternative is
+    # last so the longer, more specific spellings above still win, and it asks
+    # for an assignment behind the separator, because that is what carried
+    # state looks like and a flag is not it: `flag{a#b}` and `issue#42` are
+    # content, and trimming them would lose the very thing we archive.
+    r"|\w[\w.~%-]*[?#][^\s<>\"']+"
+    r"))",
+    re.IGNORECASE,
+)
+# WHATWG URL parsing ignores ASCII tab, newline and carriage return anywhere
+# in a URL. Embedded source still owns its ordinary line breaks, so only the
+# authority prefix through a syntactic userinfo separator is canonicalized
+# before the ordinary URL-token scanner runs.
+URL_USERINFO_PREFIX_RE = re.compile(
+    r"(?:"
+    r"[\\/]{2,}"
+    r"|(?<![A-Za-z0-9_])(?:"
+    r"https?:[\\/]*|[A-Za-z][A-Za-z0-9+.-]*://|//"
+    r")"
+    r")"
+    r"(?=[^\\/?#\x20\f\v<>\"']*@)"
+    r"[^\\/?#\x20\f\v<>\"']*@",
+    re.IGNORECASE,
+)
+FLAG_PAYLOAD_RE = re.compile(r"\bflag\{[^{}\r\n]*\}", re.IGNORECASE)
+MARKDOWN_DESTINATION_RE = re.compile(
+    r"(\]\(\s*<?)([^)\s>]+)(>?)",
+)
+HTML_QUOTED_URL_ATTRIBUTE_RE = re.compile(
+    r"(\b(?:src|href|poster|action|data)\s*=\s*)([\"'])(.*?)(\2)",
+    re.IGNORECASE | re.DOTALL,
+)
+HTML_UNQUOTED_URL_ATTRIBUTE_RE = re.compile(
+    r"(\b(?:src|href|poster|action|data)\s*=\s*)([^\s>\"']+)",
+    re.IGNORECASE,
+)
 # How many collision suffixes one candidate name may be asked for before the
 # next candidate is tried instead. A secret that survives every suffix of one
 # name is a name we should stop spelling, not one to keep counting on.
 SAFE_NAME_ATTEMPTS = 8
+# Keep sanitized metadata comfortably inside the recursion budgets of both
+# Python and downstream JSON/HTML rendering. The count is containers, not
+# scalar leaves: a scalar below 64 dict/list containers remains valid.
+MAX_METADATA_NESTING = 64
+WHATWG_IGNORED_URL_CHARACTERS = "\t\n\r"
+
+
+def normalize_unicode_text(value):
+    """Return text containing Unicode scalar values only.
+
+    JSON can decode an isolated UTF-16 surrogate even though UTF-8 cannot
+    encode it. Replacing those code points at the first text boundary keeps
+    metadata, paths, rendering and final writes on the same deterministic
+    spelling instead of exposing a raw ``UnicodeEncodeError``.
+    """
+    text = str(value)
+    if not any(0xD800 <= ord(character) <= 0xDFFF for character in text):
+        return text
+    return "".join(
+        "\ufffd" if 0xD800 <= ord(character) <= 0xDFFF else character
+        for character in text
+    )
+
+
+def _secret_spellings(secrets):
+    """Configured secrets and the compatibility spellings they normalize to."""
+    result = []
+    seen = set()
+    for secret in secrets:
+        if not secret:
+            continue
+        original = normalize_unicode_text(secret)
+        for spelling in (original, unicodedata.normalize("NFKC", original)):
+            if spelling and spelling not in seen:
+                seen.add(spelling)
+                result.append(spelling)
+    return tuple(result)
+
+
+def redaction_marker(secrets=()):
+    """Choose a fixed marker that cannot itself disclose any given secret."""
+    spellings = _secret_spellings(secrets)
+    for candidate in REDACTION_MARKERS:
+        normalized = unicodedata.normalize("NFKC", candidate)
+        if not any(
+            spelling in candidate or spelling in normalized
+            for spelling in spellings
+        ):
+            return candidate
+    # REDACTION_MARKERS ends in the empty string, which is conflict-free for
+    # every non-empty secret. Keep this guard explicit if the catalog changes.
+    return ""
+
+
+def _remove_whatwg_url_controls(value):
+    return normalize_unicode_text(value).translate(
+        {ord(character): None for character in WHATWG_IGNORED_URL_CHARACTERS}
+    )
 
 
 def sanitize_component(value, fallback="unnamed", max_length=120):
-    value = unicodedata.normalize("NFKC", str(value))
+    value = unicodedata.normalize("NFKC", normalize_unicode_text(value))
     cleaned = []
     for character in value:
         category = unicodedata.category(character)
@@ -80,7 +218,7 @@ def display_text(value, max_length=80):
     so a name must never be able to end the line, move the cursor, or start an
     escape sequence. Only a plain space survives from the whitespace class.
     """
-    value = unicodedata.normalize("NFKC", str(value))
+    value = unicodedata.normalize("NFKC", normalize_unicode_text(value))
     cleaned = []
     for character in value:
         if character != " " and (
@@ -107,7 +245,7 @@ def display_name(value, max_length=80):
     """
     if not isinstance(value, (str, int, float)):
         return WITHHELD
-    text = unicodedata.normalize("NFKC", str(value))
+    text = unicodedata.normalize("NFKC", normalize_unicode_text(value))
     if any(
         character not in DISPLAY_PUNCTUATION
         and not character.isalnum()
@@ -126,7 +264,7 @@ def display_path(value, max_length=80):
     otherwise a signed URL smuggled into a file name would put its signature
     on the terminal.
     """
-    text = str(value)
+    text = normalize_unicode_text(value)
     for separator in ("?", "#"):
         text = text.split(separator, 1)[0]
     return display_text(text, max_length)
@@ -143,7 +281,59 @@ def temporary_output_name(name):
     to reason about what reaches the disk - the writer here and the boundary
     that settles a name before the write - derives it the same way.
     """
-    return f".{name}.part"
+    return f".{normalize_unicode_text(name)}.part"
+
+
+class UniqueNameAllocator:
+    """Amortized-linear allocation for one output directory.
+
+    Reservations include both committed targets and every temporary sibling a
+    target will use. That makes the collision rule bidirectional: choosing
+    ``X`` reserves ``X.part``, while choosing ``X.part`` first prevents a later
+    ``X`` from using that committed file as its temporary output.
+    """
+
+    def __init__(self, used=()):
+        self._targets = {normalize_unicode_text(name).casefold() for name in used}
+        self._reserved = set(self._targets)
+        self._initialized_sibling_sets = set()
+        self._next_suffixes = {}
+        self.probe_count = 0
+
+    @staticmethod
+    def _spellings(name, siblings):
+        return (name, *(f"{name}{suffix}" for suffix in siblings))
+
+    def reserve_existing_siblings(self, siblings):
+        siblings = tuple(normalize_unicode_text(suffix) for suffix in siblings)
+        key = tuple(suffix.casefold() for suffix in siblings)
+        if key in self._initialized_sibling_sets:
+            return
+        self._initialized_sibling_sets.add(key)
+        for name in self._targets:
+            self._reserved.update(
+                spelling.casefold()
+                for spelling in self._spellings(name, siblings)
+            )
+
+    def allocate(self, name, *, keep_extension=True, siblings=()):
+        name = normalize_unicode_text(name)
+        siblings = tuple(normalize_unicode_text(suffix) for suffix in siblings)
+        stem, suffix = os.path.splitext(name) if keep_extension else (name, "")
+        key = (name.casefold(), keep_extension, tuple(item.casefold() for item in siblings))
+        counter = self._next_suffixes.get(key, 1)
+        while True:
+            candidate = name if counter == 1 else f"{stem}__{counter}{suffix}"
+            counter += 1
+            self._next_suffixes[key] = counter
+            self.probe_count += 1
+            spellings = self._spellings(candidate, siblings)
+            folded = tuple(spelling.casefold() for spelling in spellings)
+            if any(spelling in self._reserved for spelling in folded):
+                continue
+            self._targets.add(folded[0])
+            self._reserved.update(folded)
+            return candidate
 
 
 def unique_name(name, used, *, keep_extension=True):
@@ -153,6 +343,7 @@ def unique_name(name, used, *, keep_extension=True):
     than changing what the file claims to be. A directory has no extension to
     keep, so the suffix goes at the end of it.
     """
+    name = normalize_unicode_text(name)
     candidate = name
     stem, suffix = os.path.splitext(name) if keep_extension else (name, "")
     counter = 2
@@ -164,13 +355,47 @@ def unique_name(name, used, *, keep_extension=True):
 
 
 def filename_from_url(url):
-    path = unquote(urlsplit(url).path)
+    try:
+        path = unquote(urlsplit(url).path)
+    except ValueError:
+        return "attachment"
     return path.rsplit("/", 1)[-1] or "attachment"
 
 
 def redact_url(url, *, force=False):
-    parsed = urlsplit(str(url))
-    if parsed.scheme.lower() in {"http", "https"}:
+    """A URL without its query or fragment, or nothing at all.
+
+    A value that cannot be parsed cannot be trimmed, and a URL we cannot trim
+    is one whose query we would otherwise persist whole: `http://[broken/?x`
+    is not a URL to any parser, but it is a perfectly good place to hide a
+    token. So an unparsable value is withheld rather than returned.
+    """
+    text = _remove_whatwg_url_controls(unescape(str(url)))
+    canonical = text
+
+    # Browsers parse these spellings as network authorities even though
+    # urllib.parse leaves the would-be authority in the path. Normalize only
+    # when that first component contains userinfo; ordinary relative paths
+    # and prose retain their spelling.
+    special = re.match(r"(?i)^(https?):[\\/]*(.*)$", canonical, re.DOTALL)
+    if special:
+        rest = special.group(2)
+        authority = re.split(r"[\\/?#]", rest, maxsplit=1)[0]
+        if "@" in authority:
+            canonical = f"{special.group(1)}://{rest.replace(chr(92), '/')}"
+    else:
+        relative = re.match(r"^[\\/]{2,}(.*)$", canonical, re.DOTALL)
+        if relative:
+            rest = relative.group(1)
+            authority = re.split(r"[\\/?#]", rest, maxsplit=1)[0]
+            if "@" in authority:
+                canonical = f"//{rest.replace(chr(92), '/')}"
+
+    try:
+        parsed = urlsplit(canonical)
+    except ValueError:
+        return WITHHELD
+    if parsed.netloc:
         netloc = parsed.netloc
         if parsed.username is not None or parsed.password is not None:
             hostname = parsed.hostname or ""
@@ -182,11 +407,76 @@ def redact_url(url, *, force=False):
                 port = None
             netloc = f"{hostname}:{port}" if port is not None else hostname
         return urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
-    if (force or str(url).startswith("/") or str(url).startswith("./")) and (
+    if (force or canonical.startswith("/") or canonical.startswith("./")) and (
         parsed.query or parsed.fragment
     ):
         return urlunsplit(("", "", parsed.path, "", ""))
-    return str(url)
+    return canonical
+
+
+def redact_urls_in_text(value):
+    """Drop URL queries/fragments without rewriting the surrounding source.
+
+    Challenge descriptions and rules are source documents rather than URL
+    fields, so treating the whole string as one URL would either lose the
+    document or retain signed links embedded inside it.  This scanner only
+    touches recognizable absolute or path-relative URL tokens.  Closing source
+    punctuation is detached before parsing and restored afterwards.
+    """
+
+    def clean(url):
+        if FLAG_PAYLOAD_RE.fullmatch(url):
+            return url
+        return redact_url(unescape(url), force=True)
+
+    def replace_url_token(match):
+        url = match.group(0)
+        trailing = ""
+        while url and url[-1] in ")]},.;":
+            trailing = url[-1] + trailing
+            url = url[:-1]
+        if any(
+            start <= match.start() and match.start() + len(url) <= end
+            for start, end in flag_ranges
+        ):
+            return match.group(0)
+        # `issue#42` is ordinary prose rather than a carried fragment. A bare
+        # opaque word or named query is withheld, while a numeric issue label
+        # keeps the established source spelling.
+        if re.fullmatch(r"[\w~%-]+#[0-9]+", url):
+            return url + trailing
+        return clean(url) + trailing
+
+    def replace_markdown(match):
+        return match.group(1) + clean(match.group(2)) + match.group(3)
+
+    def replace_quoted_attribute(match):
+        return (
+            match.group(1)
+            + match.group(2)
+            + clean(match.group(3))
+            + match.group(4)
+        )
+
+    def replace_unquoted_attribute(match):
+        return match.group(1) + clean(match.group(2))
+
+    # Character references can spell every structural part of a URL. Decode
+    # them before looking for URL-shaped text so `&sol;&sol;user:pass@host`
+    # cannot hide its authority from the scheme-relative scanner.
+    canonical = unescape(normalize_unicode_text(value))
+    canonical = URL_USERINFO_PREFIX_RE.sub(
+        lambda match: _remove_whatwg_url_controls(match.group(0)),
+        canonical,
+    )
+    result = MARKDOWN_DESTINATION_RE.sub(replace_markdown, canonical)
+    result = HTML_QUOTED_URL_ATTRIBUTE_RE.sub(replace_quoted_attribute, result)
+    result = HTML_UNQUOTED_URL_ATTRIBUTE_RE.sub(
+        replace_unquoted_attribute,
+        result,
+    )
+    flag_ranges = [match.span() for match in FLAG_PAYLOAD_RE.finditer(result)]
+    return SOURCE_URL_RE.sub(replace_url_token, result)
 
 
 def redact_secrets(value, secrets=()):
@@ -198,15 +488,16 @@ def redact_secrets(value, secrets=()):
     no secret keeps its own spelling, because normalizing it would rewrite a
     value we were only asked to inspect.
     """
-    result = str(value)
-    for secret in secrets:
-        if not secret:
-            continue
-        secret = str(secret)
-        result = result.replace(secret, WITHHELD)
-        normalized = unicodedata.normalize("NFKC", result)
-        if secret in normalized:
-            result = normalized.replace(secret, WITHHELD)
+    result = normalize_unicode_text(value)
+    spellings = _secret_spellings(secrets)
+    marker = redaction_marker(spellings)
+    for spelling in spellings:
+        result = result.replace(spelling, marker)
+    normalized = unicodedata.normalize("NFKC", result)
+    if any(spelling in normalized for spelling in spellings):
+        result = normalized
+        for spelling in spellings:
+            result = result.replace(spelling, marker)
     return result
 
 
@@ -216,7 +507,46 @@ def _spells_secret(component, secrets):
     `sanitize_component` normalized it, so the component's own spelling is the
     last one left to check.
     """
-    return any(secret and str(secret) in component for secret in secrets)
+    component = normalize_unicode_text(component)
+    normalized = unicodedata.normalize("NFKC", component)
+    return any(
+        spelling in component or spelling in normalized
+        for spelling in _secret_spellings(secrets)
+    )
+
+
+def _credential_safe_literal(preferred, secrets, alternatives, max_length):
+    """Choose bounded public text that contains no configured credential."""
+    for candidate in (preferred, *alternatives, ""):
+        candidate = normalize_unicode_text(candidate)[:max_length]
+        if not _spells_secret(candidate, secrets):
+            return candidate
+    # The final candidate above is empty and no configured credential is, so
+    # this is only a defensive return if that invariant changes.
+    return ""
+
+
+def credential_safe_error(code, message, secrets=(), *, status=None):
+    """Build an error whose bounded public fields cannot quote a credential.
+
+    Ordinary credentials retain the established code and useful message.
+    Very short or collectively exhaustive credentials select from fixed text
+    that is independent of the credential, with the empty string as the
+    finite last resort.
+    """
+    safe_code = _credential_safe_literal(
+        code,
+        secrets,
+        ("blocked", "refused", "x", "q", "z", "0"),
+        64,
+    )
+    safe_message = _credential_safe_literal(
+        message,
+        secrets,
+        ("output blocked", "request refused", "x", "q", "z", "0"),
+        120,
+    )
+    return CollectorError(safe_code, safe_message, status=status)
 
 
 def sanitize_component_without_secrets(
@@ -262,7 +592,7 @@ def path_spells_secret(parts, secrets=()):
     own - the normalized form is checked all the same, because a path that
     only needs normalizing to spell the token is the token.
     """
-    joined = "/".join(str(part) for part in parts)
+    joined = "/".join(normalize_unicode_text(part) for part in parts)
     return _spells_secret(joined, secrets) or _spells_secret(
         unicodedata.normalize("NFKC", joined),
         secrets,
@@ -278,7 +608,9 @@ def _name_candidates(preferred, seed, fallback, max_length):
     collection recognizes what the first one wrote, and it keeps two
     challenges apart where the bare fallback word would merge them.
     """
-    digest = hashlib.sha256(str(seed).encode("utf-8")).hexdigest()[:16]
+    preferred = normalize_unicode_text(preferred)
+    fallback = normalize_unicode_text(fallback)
+    digest = hashlib.sha256(normalize_unicode_text(seed).encode("utf-8")).hexdigest()[:16]
     return (
         preferred,
         sanitize_component(f"{fallback}_{digest}", SAFE_COMPONENT, max_length),
@@ -313,20 +645,24 @@ def safe_unique_component(
     a path we cannot name safely is one we must not write.
     """
     seed = preferred if seed is None else seed
+    persistent_allocator = isinstance(used, UniqueNameAllocator)
+    allocator = used if persistent_allocator else UniqueNameAllocator(used)
+    allocator.reserve_existing_siblings(siblings)
     for candidate in _name_candidates(preferred, seed, fallback, max_length):
-        # `unique_name` reserves what it hands back, so asking a copy of the
-        # reservations again yields the next suffix rather than the name that
-        # was just refused.
-        offered = set(used)
         for _attempt in range(SAFE_NAME_ATTEMPTS):
-            name = unique_name(candidate, offered, keep_extension=keep_extension)
+            name = allocator.allocate(
+                candidate,
+                keep_extension=keep_extension,
+                siblings=siblings,
+            )
             paths = [(*parent_parts, name)]
             paths.extend((*parent_parts, name, *child) for child in children)
             paths.extend(
                 (*parent_parts, f"{name}{suffix}") for suffix in siblings
             )
             if not any(path_spells_secret(path, secrets) for path in paths):
-                used.add(name.casefold())
+                if not persistent_allocator:
+                    used.add(name.casefold())
                 return name
     raise CollectorError(
         "unsafe_name",
@@ -335,7 +671,7 @@ def safe_unique_component(
 
 
 def _normalized_key_parts(key):
-    value = str(key)
+    value = normalize_unicode_text(key)
     value = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", value)
     value = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", value)
     return tuple(
@@ -347,6 +683,7 @@ def _sensitive_key(key):
     parts = _normalized_key_parts(key)
     return bool(
         SENSITIVE_KEY_PARTS.intersection(parts)
+        or any(SENSITIVE_COMPOUND_KEY_RE.fullmatch(part) for part in parts)
         or any(
             parts[index : index + 2] == ("api", "key")
             for index in range(max(0, len(parts) - 1))
@@ -354,18 +691,114 @@ def _sensitive_key(key):
     )
 
 
+def _metadata_key_available(candidate, result, secrets):
+    """Whether a finished metadata key is both unused and secret-free."""
+    return candidate not in result and redact_secrets(candidate, secrets) == candidate
+
+
+def _next_private_scalar(value):
+    """The next deterministic private-use scalar, or ``None`` at exhaustion."""
+    if value < 0xE000:
+        return 0xE000
+    if value < 0xF8FF:
+        return value + 1
+    if value < 0xF0000:
+        return 0xF0000
+    if value < 0xFFFFD:
+        return value + 1
+    if value < 0x100000:
+        return 0x100000
+    if value < 0x10FFFD:
+        return value + 1
+    return None
+
+
+def _unique_metadata_key(safe_key, result, secrets, next_suffixes):
+    if _metadata_key_available(safe_key, result, secrets):
+        return safe_key
+
+    counter_key = ("numeric", safe_key)
+    counter = next_suffixes.get(counter_key, 2)
+    suffix_stem = f"{safe_key}__"
+    suffix_stem = redact_secrets(suffix_stem, secrets)
+    # Preserve the established readable suffix when it is safe, but do not
+    # count forever when a configured secret conflicts with every digit.
+    for _attempt in range(32):
+        candidate = f"{suffix_stem}{counter}"
+        counter += 1
+        next_suffixes[counter_key] = counter
+        if _metadata_key_available(candidate, result, secrets):
+            return candidate
+
+    # Private-use scalars are stable under NFKC and do not derive any plaintext
+    # from the secret. The finite scalar space gives this path a hard stop while
+    # providing far more unique keys than bounded metadata can contain.
+    private_key = ("private", safe_key)
+    codepoint = next_suffixes.get(private_key, 0xDFFF)
+    marker = redaction_marker(secrets)
+    while True:
+        codepoint = _next_private_scalar(codepoint)
+        if codepoint is None:
+            raise CollectorError(
+                "invalid_api_data",
+                "metadata keys cannot be represented safely",
+            )
+        next_suffixes[private_key] = codepoint
+        candidate = f"{marker}{chr(codepoint)}"
+        if _metadata_key_available(candidate, result, secrets):
+            return candidate
+
+
 def safe_metadata(value, key="", secrets=()):
+    return _safe_metadata(value, key, secrets, 0)
+
+
+def _safe_metadata(value, key, secrets, depth):
+    if isinstance(value, float) and not math.isfinite(value):
+        raise CollectorError(
+            "invalid_api_data",
+            "metadata contains a non-finite number",
+        )
     if key and _sensitive_key(key):
-        return "[REDACTED]"
+        return redaction_marker(secrets)
+    if isinstance(value, (dict, list)) and depth >= MAX_METADATA_NESTING:
+        raise CollectorError(
+            "metadata_too_deep",
+            "metadata nesting exceeds the supported limit",
+        )
     if isinstance(value, dict):
-        return {
-            str(item_key): safe_metadata(item_value, str(item_key), secrets)
-            for item_key, item_value in value.items()
-        }
+        result = {}
+        next_suffixes = {}
+        for item_key, item_value in value.items():
+            original_key = normalize_unicode_text(item_key)
+            safe_key = redact_urls_in_text(
+                redact_secrets(original_key, secrets)
+            )
+            candidate = _unique_metadata_key(
+                safe_key,
+                result,
+                secrets,
+                next_suffixes,
+            )
+            # Classification follows the completed key that will actually be
+            # stored, after entity decoding, redaction, and collision suffixing.
+            if _sensitive_key(candidate):
+                result[candidate] = redaction_marker(secrets)
+            else:
+                result[candidate] = _safe_metadata(
+                    item_value,
+                    candidate,
+                    secrets,
+                    depth + 1,
+                )
+        return result
     if isinstance(value, list):
-        return [safe_metadata(item, key, secrets) for item in value]
+        return [
+            _safe_metadata(item, key, secrets, depth + 1)
+            for item in value
+        ]
     if isinstance(value, str):
-        lowered_key = str(key).lower()
+        lowered_key = normalize_unicode_text(key).lower()
         url_value = (
             lowered_key in {
                 "files",
@@ -380,8 +813,185 @@ def safe_metadata(value, key="", secrets=()):
             or lowered_key.endswith("_url")
             or lowered_key == "url"
         )
-        return redact_url(redact_secrets(value, secrets), force=url_value)
+        redacted = redact_secrets(value, secrets)
+        if url_value:
+            # URL-valued metadata is a URL, not surrounding prose. Settle its
+            # outer whitespace before classification so a leading space
+            # cannot bypass the scheme-relative authority check.
+            canonical = _remove_whatwg_url_controls(unescape(redacted)).strip()
+            return redact_secrets(redact_url(canonical, force=True), secrets)
+        return redact_secrets(redact_urls_in_text(redacted), secrets)
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        text = str(value)
+        if redact_secrets(text, secrets) != text:
+            return redaction_marker(secrets)
     return value
+
+
+def safe_json_text(value, secrets=(), *, normalize_surrogates=False):
+    """Serialize JSON without changing trusted decoded keys or values.
+
+    API metadata is redacted before it reaches this boundary.  A configured
+    token can nevertheless equal a collector-owned JSON key or enum value;
+    changing that decoded value would corrupt the output contract.  JSON's
+    Unicode escapes let the on-disk spelling omit those coincidental bytes
+    while ``json.loads`` still sees the collector-owned schema.
+
+    Only text inside JSON strings is escaped.  If a credential collides with
+    unavoidable JSON grammar, the document cannot be represented safely and
+    the caller gets a bounded, credential-free refusal.
+    """
+    spellings = tuple(
+        sorted(
+            _secret_spellings(secrets),
+            key=lambda item: (-len(item), item),
+        )
+    )
+    used_characters = set(spellings)
+
+    def collect_characters(item):
+        if isinstance(item, dict):
+            for item_key, item_value in item.items():
+                if isinstance(item_key, str):
+                    used_characters.update(item_key)
+                collect_characters(item_value)
+        elif isinstance(item, (list, tuple)):
+            for child in item:
+                collect_characters(child)
+        elif isinstance(item, str):
+            used_characters.update(item)
+
+    collect_characters(value)
+    placeholder_expansions = {}
+    expansion_placeholders = {}
+    next_placeholder = 0xDFFF
+
+    def placeholder(expansion):
+        nonlocal next_placeholder
+        existing = expansion_placeholders.get(expansion)
+        if existing is not None:
+            return existing
+        while True:
+            next_placeholder = _next_private_scalar(next_placeholder)
+            if next_placeholder is None:
+                raise credential_safe_error(
+                    "unsafe_credential",
+                    "required JSON cannot be encoded without disclosing a credential",
+                    secrets,
+                )
+            candidate = chr(next_placeholder)
+            if candidate not in used_characters:
+                break
+        used_characters.add(candidate)
+        placeholder_expansions[candidate] = expansion
+        expansion_placeholders[expansion] = candidate
+        return candidate
+
+    def code_unit_escapes(code_unit):
+        digits = f"{code_unit:04X}"
+        candidates = [""]
+        for digit in digits:
+            choices = (digit.lower(), digit.upper()) if digit in "ABCDEF" else (digit,)
+            candidates = [prefix + choice for prefix in candidates for choice in choices]
+        return tuple(f"\\u{digits_variant}" for digits_variant in candidates)
+
+    def scalar_escape(character):
+        codepoint = ord(character)
+        if codepoint <= 0xFFFF:
+            candidates = code_unit_escapes(codepoint)
+        else:
+            scalar = codepoint - 0x10000
+            high = 0xD800 + (scalar >> 10)
+            low = 0xDC00 + (scalar & 0x3FF)
+            candidates = tuple(
+                first + second
+                for first in code_unit_escapes(high)
+                for second in code_unit_escapes(low)
+            )
+        short_escape = {
+            '"': '\\"',
+            "\\": "\\\\",
+            "\b": "\\b",
+            "\f": "\\f",
+            "\n": "\\n",
+            "\r": "\\r",
+            "\t": "\\t",
+        }.get(character)
+        if short_escape is not None:
+            candidates = (*candidates, short_escape)
+        for candidate in candidates:
+            if not _spells_secret(candidate, spellings):
+                return candidate
+        return candidates[0]
+
+    def transform_text(text):
+        if any(0xD800 <= ord(character) <= 0xDFFF for character in text):
+            if normalize_surrogates:
+                text = normalize_unicode_text(text)
+            else:
+                raise credential_safe_error(
+                    "invalid_output",
+                    "JSON text contains an isolated Unicode surrogate",
+                    secrets,
+                )
+        result = []
+        index = 0
+        while index < len(text):
+            spelling = next(
+                (item for item in spellings if text.startswith(item, index)),
+                None,
+            )
+            if spelling is not None:
+                expansion = "".join(scalar_escape(character) for character in spelling)
+                result.append(placeholder(expansion))
+                index += len(spelling)
+                continue
+            character = text[index]
+            # Prevent json.dumps from creating short escapes behind our back.
+            # Quotes, reverse solidi and controls are represented with the
+            # same semantic Unicode escapes used for credential occurrences.
+            if character in {'"', "\\"} or ord(character) < 0x20:
+                result.append(placeholder(scalar_escape(character)))
+            else:
+                result.append(character)
+            index += 1
+        return "".join(result)
+
+    def transform(item):
+        if isinstance(item, dict):
+            return {
+                transform_text(item_key) if isinstance(item_key, str) else item_key:
+                transform(item_value)
+                for item_key, item_value in item.items()
+            }
+        if isinstance(item, list):
+            return [transform(child) for child in item]
+        if isinstance(item, tuple):
+            return tuple(transform(child) for child in item)
+        if isinstance(item, str):
+            return transform_text(item)
+        return item
+
+    payload = (
+        json.dumps(
+            transform(value),
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+            separators=(",", ": "),
+            allow_nan=False,
+        )
+        + "\n"
+    )
+    for marker, expansion in placeholder_expansions.items():
+        payload = payload.replace(marker, expansion)
+    if any(spelling in payload for spelling in spellings):
+        raise credential_safe_error(
+            "unsafe_credential",
+            "required JSON cannot be encoded without disclosing a credential",
+            secrets,
+        )
+    return payload
 
 
 def _dirfd_capability_error():
@@ -479,7 +1089,7 @@ class SafeOutput:
 
     @staticmethod
     def _parts(parts):
-        checked = tuple(str(part) for part in parts)
+        checked = tuple(normalize_unicode_text(part) for part in parts)
         if any(
             not part
             or part in {".", ".."}
@@ -588,8 +1198,12 @@ class SafeOutput:
         if info is not None:
             os.unlink(name, dir_fd=descriptor)
 
-    def read_bytes(self, parts):
+    def read_bytes(self, parts, maximum=None):
         parts = self._parts(parts)
+        if maximum is not None and (
+            isinstance(maximum, bool) or not isinstance(maximum, int) or maximum < 0
+        ):
+            raise CollectorError("invalid_limit", "read limit must be a non-negative integer")
         directory = self.open_directory(parts[:-1], create=False)
         try:
             self._ensure_regular_or_missing(directory, parts[-1])
@@ -612,14 +1226,23 @@ class SafeOutput:
                     )
                 with os.fdopen(descriptor, "rb") as stream:
                     descriptor = None
-                    return stream.read()
+                    return stream.read() if maximum is None else stream.read(maximum)
             finally:
                 if descriptor is not None:
                     os.close(descriptor)
         finally:
             os.close(directory)
 
-    def hash_file(self, parts, maximum):
+    def hash_file(self, parts, maximum, *, prefix_bytes=0):
+        if (
+            isinstance(prefix_bytes, bool)
+            or not isinstance(prefix_bytes, int)
+            or prefix_bytes < 0
+        ):
+            raise CollectorError(
+                "invalid_limit",
+                "prefix size must be a non-negative integer",
+            )
         parts = self._parts(parts)
         try:
             directory = self.open_directory(parts[:-1], create=False)
@@ -640,6 +1263,7 @@ class SafeOutput:
                     raise CollectorError("unsafe_path", "output file is a symlink") from exc
                 raise
             digest = hashlib.sha256()
+            prefix = bytearray()
             size = 0
             try:
                 with os.fdopen(descriptor, "rb") as stream:
@@ -654,11 +1278,17 @@ class SafeOutput:
                                 "file_too_large",
                                 "existing file exceeds file limit",
                             )
+                        if len(prefix) < prefix_bytes:
+                            remaining = prefix_bytes - len(prefix)
+                            prefix.extend(chunk[:remaining])
                         digest.update(chunk)
             finally:
                 if descriptor is not None:
                     os.close(descriptor)
-            return size, digest.hexdigest()
+            result = (size, digest.hexdigest())
+            if prefix_bytes:
+                return (*result, bytes(prefix))
+            return result
         finally:
             os.close(directory)
 
@@ -748,18 +1378,10 @@ class SafeOutput:
                 ) from exc
             raise
 
-    def atomic_json(self, parts, value):
+    def atomic_bytes(self, parts, payload):
         parts = self._parts(parts)
-        payload = (
-            json.dumps(
-                value,
-                ensure_ascii=False,
-                indent=2,
-                sort_keys=True,
-                separators=(",", ": "),
-            )
-            + "\n"
-        ).encode("utf-8")
+        if not isinstance(payload, bytes):
+            raise TypeError("atomic_bytes payload must be bytes")
         temporary_name = temporary_output_name(parts[-1])
         directory = None
         try:
@@ -791,3 +1413,12 @@ class SafeOutput:
         finally:
             if directory is not None:
                 os.close(directory)
+
+    def atomic_text(self, parts, value):
+        if not isinstance(value, str):
+            raise TypeError("atomic_text value must be str")
+        self.atomic_bytes(parts, normalize_unicode_text(value).encode("utf-8"))
+
+    def atomic_json(self, parts, value, *, secrets=()):
+        payload = safe_json_text(value, secrets, normalize_surrogates=True)
+        self.atomic_text(parts, payload)

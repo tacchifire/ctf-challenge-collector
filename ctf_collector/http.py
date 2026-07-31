@@ -1,10 +1,12 @@
 import email.utils
 from http.client import HTTPException
 import json
+import math
+import re
 import ssl
 import time
 from urllib.error import HTTPError, URLError
-from urllib.parse import urljoin, urlsplit, urlunsplit
+from urllib.parse import quote, urljoin, urlsplit, urlunsplit
 from urllib.request import (
     HTTPHandler,
     HTTPSHandler,
@@ -19,6 +21,27 @@ from .errors import CollectorError
 
 RETRYABLE_STATUSES = {408, 425, 429, 500, 502, 503, 504}
 REDIRECT_STATUSES = {301, 302, 303, 307, 308}
+MAX_JSON_INTEGER_DIGITS = 4300
+PERCENT_ESCAPE_RE = re.compile(r"%[0-9A-Fa-f]{2}")
+PATH_SAFE_CHARACTERS = "/:@!$&'()*+,;=-._~"
+QUERY_SAFE_CHARACTERS = f"{PATH_SAFE_CHARACTERS}?"
+
+
+def _unicode_scalar_text(value):
+    """Return URL input that can always cross a UTF-8 boundary.
+
+    URL handling is deliberately kept below the collector/safety layers, so
+    this small ingress normalizer lives here instead of importing either and
+    creating a dependency cycle. JSON may contain an isolated UTF-16
+    surrogate even though a URL identity can only contain Unicode scalars.
+    """
+    text = str(value)
+    if not any(0xD800 <= ord(character) <= 0xDFFF for character in text):
+        return text
+    return "".join(
+        "\ufffd" if 0xD800 <= ord(character) <= 0xDFFF else character
+        for character in text
+    )
 
 
 class NoRedirect(HTTPRedirectHandler):
@@ -26,8 +49,70 @@ class NoRedirect(HTTPRedirectHandler):
         return None
 
 
+def _split(url):
+    """`urlsplit` that reports a malformed URL the way every caller expects.
+
+    An unterminated IPv6 literal makes `urlsplit` raise `ValueError`, which
+    would leave the URL text in a traceback and end a collection that should
+    only have lost one attachment.
+    """
+    try:
+        return urlsplit(_unicode_scalar_text(url))
+    except ValueError as exc:
+        raise CollectorError("invalid_url", "URL cannot be parsed") from exc
+
+
+def _joined(base, reference):
+    """`urljoin` that cannot end a run over a malformed reference."""
+    try:
+        return urljoin(
+            _unicode_scalar_text(base),
+            _unicode_scalar_text(reference),
+        )
+    except ValueError as exc:
+        raise CollectorError("invalid_url", "URL cannot be parsed") from exc
+
+
+def _quoted_component(value, safe):
+    """UTF-8 quote a URL component without double-encoding valid escapes."""
+    result = []
+    position = 0
+    for match in PERCENT_ESCAPE_RE.finditer(value):
+        result.append(quote(value[position : match.start()], safe=safe))
+        result.append(match.group(0))
+        position = match.end()
+    result.append(quote(value[position:], safe=safe))
+    return "".join(result)
+
+
+def _bounded_json_int(value):
+    if len(value.removeprefix("-")) > MAX_JSON_INTEGER_DIGITS:
+        raise ValueError("JSON integer exceeds digit limit")
+    return int(value)
+
+
+def _finite_json_float(value):
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError("JSON float is not finite")
+    return number
+
+
+def _reject_json_constant(_value):
+    raise ValueError("JSON constant is not finite")
+
+
+def _loads_json(value):
+    return json.loads(
+        value,
+        parse_int=_bounded_json_int,
+        parse_float=_finite_json_float,
+        parse_constant=_reject_json_constant,
+    )
+
+
 def normalized_origin(url):
-    parsed = urlsplit(str(url))
+    parsed = _split(url)
     scheme = parsed.scheme.lower()
     if scheme not in {"http", "https"}:
         raise CollectorError("invalid_url", "only http and https URLs are allowed")
@@ -45,12 +130,14 @@ def normalized_origin(url):
 
 
 def validated_url(url):
-    value = str(url)
+    value = _unicode_scalar_text(url)
     if any(character.isspace() or ord(character) < 32 or ord(character) == 127 for character in value):
         raise CollectorError("invalid_url", "URL contains whitespace or control characters")
     normalized_origin(value)
-    parsed = urlsplit(value)
-    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path or "/", parsed.query, ""))
+    parsed = _split(value)
+    path = _quoted_component(parsed.path or "/", PATH_SAFE_CHARACTERS)
+    query = _quoted_component(parsed.query, QUERY_SAFE_CHARACTERS)
+    return urlunsplit((parsed.scheme, parsed.netloc, path, query, ""))
 
 
 class HttpClient:
@@ -95,7 +182,23 @@ class HttpClient:
         )
 
     def resolve(self, value):
-        return validated_url(urljoin(f"{self.base_url}/", str(value)))
+        value = _unicode_scalar_text(value)
+        if any(
+            character.isspace()
+            or ord(character) < 32
+            or ord(character) == 127
+            for character in value
+        ):
+            raise CollectorError(
+                "invalid_url",
+                "URL contains whitespace or control characters",
+            )
+        return validated_url(_joined(f"{self.base_url}/", value))
+
+    def resolve_attachment(self, value):
+        url = self.resolve(value)
+        self._allowed(url, attachment=True)
+        return url
 
     def _allowed(self, url, attachment):
         origin = normalized_origin(url)
@@ -108,7 +211,7 @@ class HttpClient:
             "request target origin is not allowed",
         )
 
-    def _headers(self, url, attachment):
+    def _headers(self, url, attachment, *, authenticated=True, accept=None):
         if attachment:
             # A byte stream download has no request body to describe, and a
             # foreign CDN has no reason to see a JSON content negotiation.
@@ -126,7 +229,13 @@ class HttpClient:
                 "Content-Type": "application/json",
                 "User-Agent": "ctf-challenge-collector/1.0",
             }
-        if self.token and normalized_origin(url) == self.base_origin:
+        if accept is not None:
+            headers["Accept"] = accept
+        if (
+            authenticated
+            and self.token
+            and normalized_origin(url) == self.base_origin
+        ):
             headers["Authorization"] = f"{self.auth_scheme} {self.token}"
         return headers
 
@@ -163,8 +272,8 @@ class HttpClient:
                 status=status,
             )
         try:
-            payload = json.loads(data.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
+            payload = _loads_json(data.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError, RecursionError):
             return None
         if not isinstance(payload, dict):
             return None
@@ -182,7 +291,14 @@ class HttpClient:
             )
         return None
 
-    def open_get(self, url, *, attachment=False):
+    def open_get(
+        self,
+        url,
+        *,
+        attachment=False,
+        authenticated=True,
+        accept=None,
+    ):
         current = validated_url(url)
         redirects = 0
         attempt = 1
@@ -190,7 +306,12 @@ class HttpClient:
             self._allowed(current, attachment)
             request = Request(
                 current,
-                headers=self._headers(current, attachment),
+                headers=self._headers(
+                    current,
+                    attachment,
+                    authenticated=authenticated,
+                    accept=accept,
+                ),
                 method="GET",
             )
             try:
@@ -211,7 +332,7 @@ class HttpClient:
                             "redirect limit exceeded",
                             status=exc.code,
                         )
-                    destination = validated_url(urljoin(current, location))
+                    destination = validated_url(_joined(current, location))
                     self._allowed(destination, attachment)
                     current = destination
                     redirects += 1
@@ -251,7 +372,7 @@ class HttpClient:
                         "redirect limit exceeded",
                         status=status,
                     )
-                destination = validated_url(urljoin(current, location))
+                destination = validated_url(_joined(current, location))
                 self._allowed(destination, attachment)
                 current = destination
                 redirects += 1
@@ -274,8 +395,12 @@ class HttpClient:
                 )
             return response, current
 
-    def get_json(self, url):
-        response, final_url = self.open_get(url, attachment=False)
+    def get_json(self, url, *, authenticated=True):
+        response, final_url = self.open_get(
+            url,
+            attachment=False,
+            authenticated=authenticated,
+        )
         try:
             data = response.read(self.max_metadata_bytes + 1)
         except (OSError, TimeoutError, HTTPException) as exc:
@@ -285,6 +410,48 @@ class HttpClient:
         if len(data) > self.max_metadata_bytes:
             raise CollectorError("metadata_too_large", "JSON response exceeds metadata limit")
         try:
-            return json.loads(data.decode("utf-8")), final_url
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            return _loads_json(data.decode("utf-8")), final_url
+        except (UnicodeDecodeError, ValueError, RecursionError) as exc:
             raise CollectorError("invalid_json", "response is not valid UTF-8 JSON") from exc
+
+    def get_text(self, url, *, accepted_types, authenticated=True):
+        response, final_url = self.open_get(
+            url,
+            attachment=False,
+            authenticated=authenticated,
+            accept=", ".join(accepted_types),
+        )
+        try:
+            content_type = response.headers.get("Content-Type")
+            media_type = (
+                content_type.split(";", 1)[0].strip().lower()
+                if content_type is not None
+                else ""
+            )
+            if media_type not in accepted_types:
+                raise CollectorError(
+                    "invalid_rules_type",
+                    "rules response has an unsupported Content-Type",
+                )
+            try:
+                data = response.read(self.max_metadata_bytes + 1)
+            except (OSError, TimeoutError, HTTPException) as exc:
+                raise CollectorError(
+                    "network_error",
+                    f"failed reading text response: {exc}",
+                ) from exc
+            if len(data) > self.max_metadata_bytes:
+                raise CollectorError(
+                    "metadata_too_large",
+                    "text response exceeds metadata limit",
+                )
+            charset = response.headers.get_content_charset() or "utf-8"
+            try:
+                return data.decode(charset), final_url
+            except (LookupError, UnicodeDecodeError) as exc:
+                raise CollectorError(
+                    "invalid_text",
+                    "rules response is not valid text in its declared charset",
+                ) from exc
+        finally:
+            response.close()

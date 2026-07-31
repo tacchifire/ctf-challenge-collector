@@ -203,7 +203,7 @@ class KeyedSourceIdentityTests(unittest.TestCase):
 
 
 class CtfDirectoryPreflightTests(unittest.TestCase):
-    def test_token_redaction_cannot_create_an_unvalidated_directory_collision(self):
+    def test_token_name_refusal_is_per_ctf_and_safe_later_name_is_collected(self):
         with tempfile.TemporaryDirectory() as tmp:
             first = make_config(tmp)
             first["name"] = "event-ctfd-secret"
@@ -213,17 +213,18 @@ class CtfDirectoryPreflightTests(unittest.TestCase):
                 lambda request: (200, {}, terminal_page([]))
             )
 
-            with (
-                patch("ctf_collector.http.build_opener", return_value=fake),
-                self.assertRaises(CollectorError) as caught,
-            ):
-                collect_all([first, second])
+            with patch("ctf_collector.http.build_opener", return_value=fake):
+                results = collect_all([first, second])
 
-            self.assertEqual(caught.exception.code, "invalid_config")
-            self.assertEqual(fake.requests, [])
-            self.assertFalse((Path(tmp) / "out").exists())
+            self.assertEqual(results[0]["error"].code, "invalid_config")
+            self.assertIsNone(results[1]["error"])
+            self.assertTrue(fake.requests)
+            self.assertFalse((Path(tmp) / "out" / "event-ctfd-secret").exists())
+            self.assertTrue(
+                (Path(tmp) / "out" / "event-_REDACTED" / "manifest.json").is_file()
+            )
 
-    def test_all_ctf_names_are_preflighted_before_any_collection_writes(self):
+    def test_later_unsafe_ctf_name_does_not_erase_earlier_collection(self):
         with tempfile.TemporaryDirectory() as tmp:
             first = make_config(tmp)
             first["name"] = "safe-first"
@@ -233,15 +234,16 @@ class CtfDirectoryPreflightTests(unittest.TestCase):
                 lambda request: (200, {}, terminal_page([]))
             )
 
-            with (
-                patch("ctf_collector.http.build_opener", return_value=fake),
-                self.assertRaises(CollectorError) as caught,
-            ):
-                collect_all([first, second])
+            with patch("ctf_collector.http.build_opener", return_value=fake):
+                results = collect_all([first, second])
 
-            self.assertEqual(caught.exception.code, "invalid_config")
-            self.assertEqual(fake.requests, [])
-            self.assertFalse((Path(tmp) / "out").exists())
+            self.assertIsNone(results[0]["error"])
+            self.assertEqual(results[1]["error"].code, "invalid_config")
+            self.assertTrue(fake.requests)
+            self.assertTrue(
+                (Path(tmp) / "out" / "safe-first" / "manifest.json").is_file()
+            )
+            self.assertFalse((Path(tmp) / "out" / "unsafe-ctfd-secret").exists())
 
 
 class PostCommitDirectoryValidationTests(unittest.TestCase):

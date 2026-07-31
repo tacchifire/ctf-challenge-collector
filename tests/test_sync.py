@@ -292,8 +292,18 @@ class SyncCliTests(unittest.TestCase):
                 all(
                     request["headers"].get("authorization") == "Bearer rctf-secret"
                     for request in server.requests
+                    if urlsplit(request["path"]).path
+                    != "/api/v1/integrations/client/config"
                 )
             )
+            client_config = [
+                request
+                for request in server.requests
+                if urlsplit(request["path"]).path
+                == "/api/v1/integrations/client/config"
+            ]
+            self.assertEqual(len(client_config), 1)
+            self.assertNotIn("authorization", client_config[0]["headers"])
             self.assertTrue(
                 all(
                     request["headers"].get("content-type") == "application/json"
@@ -501,7 +511,7 @@ class SyncCliTests(unittest.TestCase):
             self.assertEqual(attempts, 2)
             self.assertEqual(
                 [request["method"] for request in server.requests],
-                ["GET", "GET"],
+                ["GET", "GET", "GET"],
             )
 
     def test_ctf_selector_does_not_contact_unselected_ctf(self):
@@ -520,7 +530,10 @@ class SyncCliTests(unittest.TestCase):
             result = self.run_sync(config_path, "--ctf", "chosen")
 
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(len(server.requests), 1)
+            self.assertEqual(
+                [urlsplit(request["path"]).path for request in server.requests],
+                ["/api/v1/challenges", "/rules"],
+            )
             self.assertIn("chosen: complete", result.stdout)
 
 

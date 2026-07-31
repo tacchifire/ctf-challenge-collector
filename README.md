@@ -113,7 +113,37 @@ custom `output_root`を使う場合は、そのパスを`.gitignore`へ追加し
 ## 出力と終了コード
 
 収集結果は既定で、設定ファイルと同じディレクトリの`collected/<安全化したCTF名>/`へ保存されます。
-各問題の`challenge.json`、添付ファイル、収集状態を記録した`manifest.json`が生成されます。
+各問題のJSONと閲覧用HTML、添付ファイル、説明中のmedia、CTFのrules、収集状態を記録した`manifest.json`が生成されます。
+
+```text
+collected/<CTF名>/
+├── manifest.json
+├── rules.html                         # rules/homeContentがある場合
+└── <category>/<id>-<問題名>/
+    ├── challenge.json
+    ├── challenge.html
+    ├── files/                         # APIが列挙した添付
+    └── media/                         # 問題文から抽出・検証した画像/音声/動画
+```
+
+`challenge.html`には、名前、category、id、value、points、hints、connection info、添付の保存先を読みやすく記録します。
+問題文のMarkdownやHTMLを描画せず、URLのquery/fragmentとtokenを除いたsource全体をescapeして`white-space: pre-wrap`で表示します。
+Markdownのinline/reference imageと、HTMLの`img`、`audio`、`video`、`source`の`src`は別途抽出します。
+取得に成功し、応答の`Content-Type`が次のallowlistに完全一致し、先頭構造の検証にも成功したものだけを`media/`から表示します：`audio/flac`、`audio/mpeg`、`audio/mp4`、`audio/ogg`、`audio/wav`、`audio/webm`、`audio/x-wav`、`image/bmp`、`image/gif`、`image/jpeg`、`image/png`、`image/webp`、`video/mp4`、`video/ogg`、`video/quicktime`、`video/webm`。
+同じ問題文に同じURLが複数回あっても、取得と表示は一度だけです。
+
+CTFdでは同一originの`/rules`を取得し、`text/html`または`text/plain`だけを受け入れます。
+redirect後の最終URLが同一originの`/rules`（末尾`/`は許容）でない場合は、login pageなどをrulesとして保存せず`rules_redirected`の部分失敗にします。
+rCTFでは`/rules`を推測せず、公式の非認証endpoint `/api/v1/integrations/client/config`の`goodClientConfig`にある`data.homeContent`だけを使います。
+内容がある場合の`rules.html`には、抽出した可読textと、tokenを除去してURLを安全化したsourceの両方を保存します。
+認証済みpageのsession stateを残さないため、`script`、`nav`、`header`、`footer`とその中身、および`meta`、`input`はsource欄からも除去します。さらに、残ったsourceにあるemail addressと、session/nonce/CSRF/auth/token/email/user/cookie/password/secret名に代入された値を除去します。
+閉じられていない除去対象要素と、HTML上でvoidではない除去対象をself-closing表記した要素は、以降をすべて捨てるfail-closedです。
+HTML commentは除去対象ではなく、source欄にescapeされた状態で残ります。
+404/410または空の内容は`unavailable`で部分失敗にせず、それ以外の取得・形式エラーは`partial`としてmanifestへ記録します。
+rules本文とrCTF config JSONには`limits.max_metadata_bytes`が適用されます。
+
+`manifest.json`の各問題には`html`、`files`、`media`があり、rootの`rules`には`source_kind`、`status`、`path`、queryなしの`source_url`があります。
+以前のmanifestにあるsource identity、size、SHA-256と保存済みbytesが一致する添付とmediaは、再取得せず`verified`として再利用します。
 
 | 終了コード | 意味 |
 |---:|---|
@@ -157,12 +187,27 @@ pipeやredirectでは途中の更新を抑止し、添付ごとの開始行と�
 
 - HTTPメソッドはGETだけです。
 - 認証情報は同一originのAPIと添付にだけ送ります。
+- rCTFのclient configは、同一originでも認証情報を送らずに取得します。
 - redirectと外部originは送信前に検証します。
 - token、cookie、secret系metadata、URLのqueryとfragmentは保存前に除去します。
-- 添付サイズと総量を制限し、一時ファイルからatomicに保存します。
+- API由来のmetadataは問題単位の境界でkeyとvalueを安全化します。collectorが生成するmanifest/challengeの固定schemaはその後にkeyを書き換えず、可変valueだけを最終防御で再確認します。別CTFのtokenが公開済みの固定key/valueと偶然一致する場合は、JSONのdecoded schemaを変えず保存bytesだけをUnicode escapeにします。
+- collector生成HTMLとの偶然の一致は、textとquoted attribute valueだけを文字参照で同じ意味のまま保存します。tag名、CSS、JSON構文など同じ意味でescapeできない固定出力との衝突は事前検査で拒否します。
+- 現在のCTFのtoken自体が固定pathなどescape不能な必須出力と衝突し、安全な出力を意味的に作れない場合は、そのCTFのdirectory作成やHTTP通信より前にcredentialを含まない有限長errorでfail closedにし、複数CTFの実行では後続を継続します。JSONの固定schema key/valueとの一致はescape可能なので拒否しません。
+- 添付とmediaは同じファイルサイズ・総量上限、実行単位の超過承認、絶対上限を共有します。再利用する`verified`なcacheも同じ承認を通り、絶対上限は承認できません。
+- mediaは`Content-Type`と先頭bytesの署名を検証し、`application/octet-stream`などをactive mediaにしません。
+- mediaの保存名が`.html`/`.htm`/`.xhtml`/`.svg`/`.xml`/`.js`/`.mjs`で終わる場合は`.bin`を付けてactiveな拡張子を残しません（再実行しても同じ名前になります）。
+- 添付へのlinkは`download`と`rel="noopener noreferrer"`を付け、clickで能動的な文書へ遷移させません。
+- 添付、media、JSON、HTMLは一時ファイルからatomicに保存します。
 - 出力先のsymlinkと危険なパス要素を拒否します。
+- 生成HTMLは`default-src 'none'`のCSPを持ち、activeな参照先は同じ問題dirの検証済み画像・音声・動画だけです。
+- server由来のscript、template、event attribute、iframe、form、object、embedは実行しません。
 
 同じUIDで同時に動く悪意あるプロセスは保護対象外であり、その相手に対するrace-freeな保存は保証しません。
+
+説明sourceは証拠保全のためescapeして残しますが、完全なMarkdown rendererやwebsite mirrorではありません。
+CSS、JavaScript、iframe、form、remote link先、HTMLの`srcset`やCSS内URLは取得しません。
+認証がqueryにだけ含まれるmedia URLは取得時にはそのまま使いますが、query/fragment自体は出力、manifest、進捗表示に残らず、source identityの一方向HMACだけが再利用判定に残ります。
+`rules.html`が以前の実行に存在し、後の実行でrulesが`unavailable`になった場合、manifestの`path`は`null`になりますが、以前のファイルは自動削除しません。
 
 通常はHTTPSと`tls.verify: true`を使ってください。
 HTTPやTLS検証の無効化は、隔離した検証環境に限ってください。

@@ -250,6 +250,8 @@ class CollectorWithoutSocketsTests(unittest.TestCase):
             same_origin = [
                 item for item in fake.requests
                 if urlsplit(item["url"]).hostname == "base.example"
+                and urlsplit(item["url"]).path
+                != "/api/v1/integrations/client/config"
             ]
             self.assertTrue(
                 all(
@@ -257,6 +259,14 @@ class CollectorWithoutSocketsTests(unittest.TestCase):
                     for item in same_origin
                 )
             )
+            client_config = [
+                item
+                for item in fake.requests
+                if urlsplit(item["url"]).path
+                == "/api/v1/integrations/client/config"
+            ]
+            self.assertEqual(len(client_config), 1)
+            self.assertNotIn("authorization", client_config[0]["headers"])
             stored = (
                 Path(tmp)
                 / "out"
