@@ -425,6 +425,160 @@ class TerminalProgressLineTests(TerminalHarness):
         )
 
 
+class FinalGaugeTests(TerminalHarness):
+    """A download that finished leaves a full gauge behind, not a stalled one.
+
+    The updates are paced, so the last one drawn is whatever happened to fall
+    on a threshold - 89%, 99%, whatever the chunks landed on - and settling
+    the line there freezes that figure on screen above a line saying the file
+    was saved. The two disagree, and the gauge is the one that is wrong, so
+    completion fills it before the line is given up.
+    """
+
+    def live_download(self, declared=100 * MIB, received=89 * MIB):
+        """A download with an unfinished update already drawn on the live line."""
+        reporter, stream, clock = self.make(min_interval=1.0, min_bytes=4 * MIB)
+        reporter(
+            {
+                "event": "attachment_start",
+                "ctf": "x",
+                "local_path": TERMINAL_PATH,
+                "declared": declared,
+            }
+        )
+        clock.advance(1.0)
+        reporter(
+            {
+                "event": "attachment_progress",
+                "ctf": "x",
+                "local_path": TERMINAL_PATH,
+                "received": received,
+                "declared": declared,
+            }
+        )
+        clock.advance(1.0)
+        return reporter, stream, clock
+
+    @staticmethod
+    def done(reporter, size=10 * MIB, status="downloaded"):
+        reporter(
+            {
+                "event": "attachment_done",
+                "ctf": "x",
+                "local_path": TERMINAL_PATH,
+                "size": size,
+                "status": status,
+            }
+        )
+
+    def test_completion_fills_the_gauge_before_it_settles_the_line(self):
+        reporter, stream, _clock = self.live_download()
+
+        self.done(reporter, size=100 * MIB)
+
+        raw = stream.getvalue()
+        # The start line, the settled live line and the saved line: the full
+        # gauge is drawn over the update it replaces, not below it.
+        self.assertEqual(raw.count("\n"), 3, raw)
+        live = raw.split("\n")[1]
+        self.assertIn(" 89% ", live)
+        self.assertEqual(
+            live.rpartition("\r")[2].rstrip(),
+            f"[x] [{'=' * 20}] 100% 100.0 MiB/100.0 MiB",
+        )
+        self.assertLess(raw.index("100%"), raw.index("saved"), raw)
+        self.assertEqual(
+            self.lines(stream)[-1],
+            f"[x] saved {TERMINAL_PATH} (100.0 MiB in 2.0s)",
+        )
+
+    def test_a_throttled_run_still_gets_the_full_gauge(self):
+        # The pacing decides which updates are drawn in flight; it has no say
+        # over the one draw that reports the download as finished.
+        reporter, stream, clock = self.make(min_interval=1.0, min_bytes=4 * MIB)
+        reporter(
+            {
+                "event": "attachment_start",
+                "ctf": "x",
+                "local_path": TERMINAL_PATH,
+                "declared": 10 * MIB,
+            }
+        )
+        clock.advance(1.0)
+        reporter(
+            {
+                "event": "attachment_progress",
+                "ctf": "x",
+                "local_path": TERMINAL_PATH,
+                "received": MIB,
+                "declared": 10 * MIB,
+            }
+        )
+        for received in (2 * MIB, 3 * MIB, 4 * MIB):
+            reporter(
+                {
+                    "event": "attachment_progress",
+                    "ctf": "x",
+                    "local_path": TERMINAL_PATH,
+                    "received": received,
+                    "declared": 10 * MIB,
+                }
+            )
+
+        self.done(reporter)
+
+        raw = stream.getvalue()
+        self.assertEqual(raw.count("\n"), 3, raw)
+        self.assertIn(f"[{'=' * 20}] 100% 10.0 MiB/10.0 MiB", raw)
+
+    def test_an_unknown_size_is_not_given_a_percentage_it_never_had(self):
+        # Nothing declared a length, so there is no share to complete: a
+        # gauge here would be filled from a number the server never sent.
+        reporter, stream, _clock = self.live_download(declared=None, received=MIB)
+
+        self.done(reporter, size=2 * MIB)
+
+        raw = stream.getvalue()
+        self.assertNotIn("%", raw)
+        self.assertEqual(raw.count("\n"), 3, raw)
+        self.assertEqual(
+            self.lines(stream)[-1],
+            f"[x] saved {TERMINAL_PATH} (2.0 MiB in 2.0s)",
+        )
+
+    def test_a_download_with_no_live_line_still_gets_a_full_gauge(self):
+        # Completion is the one unthrottled progress update: even a short file
+        # must visibly reach 100% before the saved result is printed.
+        reporter, stream, clock = self.make(min_interval=1.0, min_bytes=4 * MIB)
+        reporter(
+            {
+                "event": "attachment_start",
+                "ctf": "x",
+                "local_path": TERMINAL_PATH,
+                "declared": 10 * MIB,
+            }
+        )
+        clock.advance(2.0)
+
+        self.done(reporter)
+
+        raw = stream.getvalue()
+        self.assertEqual(raw.count("\n"), 3, raw)
+        self.assertIn(f"[{'=' * 20}] 100% 10.0 MiB/10.0 MiB", raw)
+        self.assertLess(raw.index("100%"), raw.index("saved"), raw)
+
+    def test_verified_reuse_draws_no_gauge(self):
+        reporter, stream, _clock = self.make()
+
+        self.done(reporter, size=512, status="verified")
+
+        self.assertEqual(
+            self.lines(stream),
+            [f"[x] verified {TERMINAL_PATH} (512 B)"],
+        )
+        self.assertNotIn("\r", stream.getvalue())
+
+
 class RecordingStream:
     """The whole stream interface the reporter uses, and no isatty at all."""
 

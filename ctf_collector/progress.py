@@ -341,12 +341,13 @@ class ProgressReporter:
 
     def _on_attachment_start(self, event):
         started = self._now()
+        declared = event.get("declared")
         self._download = {
             "started": started,
             "last_emit": started,
             "last_bytes": 0,
+            "declared": declared,
         }
-        declared = event.get("declared")
         size = "size unknown" if declared is None else format_bytes(declared)
         self._write(event["ctf"], f"downloading {self._path(event)} ({size})")
 
@@ -387,6 +388,27 @@ class ProgressReporter:
             columns,
         )
 
+    def _complete_live_line(self, event, state):
+        """Fill the gauge the download left part way before the line is given up.
+
+        The updates are paced, so the last one drawn is wherever a threshold
+        happened to fall - and settling the line there leaves that figure
+        standing above a line reporting the file as saved. The final draw is
+        released by the result rather than by the pacing, and it takes its
+        size from the result too, so the gauge ends where the file did. A
+        download nobody declared a length for has no share to complete: a
+        gauge filled here would be filled from a number the server never
+        sent, so its line is settled as it stands.
+        """
+        if not self._terminal or state is None or not state["declared"]:
+            return
+        received = event["size"]
+        columns = terminal_columns(self._stream)
+        self._update(
+            self._live_line(event["ctf"], received, received, "", columns),
+            columns,
+        )
+
     def _on_attachment_done(self, event):
         state = self._download
         self._download = None
@@ -394,6 +416,7 @@ class ProgressReporter:
         if event.get("status") == "verified":
             self._write(event["ctf"], f"verified {self._path(event)} ({size})")
             return
+        self._complete_live_line(event, state)
         elapsed = self._reading(state) - state["started"] if state else 0.0
         self._write(
             event["ctf"],

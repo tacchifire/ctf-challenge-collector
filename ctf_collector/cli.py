@@ -10,6 +10,9 @@ from .errors import CollectorError
 from .progress import ProgressReporter
 
 
+MIB = 1024 * 1024
+
+
 EXAMPLE_CONFIG = {
     "ctfs": [
         {
@@ -62,29 +65,49 @@ def make_parser():
     return parser
 
 
+def _overage(subject, required, limit):
+    """One overage, in the sizes the operator reads on the same screen.
+
+    How far past the limit the file puts the run is what the answer turns
+    on, so it leads; the figures behind it are there to check that against.
+    """
+    return (
+        f"{subject}{(required - limit) / MIB:.1f} MiB超えます"
+        f"（{required / MIB:.1f} MiB / 上限{limit / MIB:.1f} MiB）。"
+    )
+
+
 def _terminal_limit_approver(request):
-    """Ask once, for the run, in the terms the run will actually honour.
+    """Ask once, for the run, in one line a person can read at a glance.
 
     The collector asks about the first oversized attachment and keeps the
-    answer for everything after it, so a prompt that named only this file
-    would be asking for less than it takes.
+    answer for everything after it, so the question names the run rather
+    than this file. Only the limits this attachment actually crosses are
+    stated: a total that is still within reach is not what is being asked
+    about.
     """
+    exceeded = request["exceeded"]
+    overages = ""
+    if exceeded in ("file", "both"):
+        overages += _overage(
+            "ファイル上限を",
+            request["required_file_bytes"],
+            request["current_file_limit"],
+        )
+    if exceeded in ("total", "both"):
+        overages += _overage(
+            "合計上限も" if exceeded == "both" else "合計上限を",
+            request["required_total_bytes"],
+            request["current_total_limit"],
+        )
     print(
-        f"{request['ctf_name']}: {request['local_path']} requires "
-        f"{request['required_file_bytes']} bytes for this file and "
-        f"{request['required_total_bytes']} bytes total; current limits are "
-        f"{request['current_file_limit']} and "
-        f"{request['current_total_limit']} bytes. Answering yes approves "
-        "every attachment that exceeds these limits for the rest of this "
-        "sync run, each one only up to the finite size it declares and "
-        "always within the absolute hard caps; the approval expires when "
-        "this run ends. Continue? Type yes: ",
+        f"{request['ctf_name']}: {request['local_path']} は{overages}\n"
+        "この実行中、同様の超過をまとめて許可しますか？ [Y/N]: ",
         file=sys.stderr,
         end="",
         flush=True,
     )
-    answer = sys.stdin.readline()
-    return answer.rstrip("\r\n") == "yes"
+    return sys.stdin.readline().rstrip("\r\n") in ("y", "Y")
 
 
 def _interactive_limit_approver():
